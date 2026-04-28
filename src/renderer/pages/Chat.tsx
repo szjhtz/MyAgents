@@ -877,7 +877,7 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
           : currentProvider;
         const providerEnv = buildProviderEnv(provider);
 
-        // 5. Send message
+        // 5. Send message (fire-and-forget — resolves before backend turn actually starts)
         setIsLoading(true);
         scrollToBottom();
         await sendMessage(
@@ -888,8 +888,13 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
           isExternalRuntime ? undefined : providerEnv
         );
 
-        // 6. Hide overlay
-        setShowStartupOverlay(false);
+        // 6. Mark initialMessage consumed. DO NOT close overlay here:
+        //    sendMessage() returns immediately (fire-and-forget), and on external
+        //    runtimes (gemini/codex) the backend is still in prewarm — sessionState
+        //    stays `idle` and isLoading gets cleared by the prewarm chat:init event.
+        //    Closing the overlay now produced the "stable idle" gap the user saw.
+        //    Overlay closure is now driven by the dedicated effect below — it waits
+        //    for the AI to actually start (sessionState='running' or streaming).
         onInitialMessageConsumedRef.current?.();
       } catch (err) {
         console.error('[Chat] Auto-send failed:', err);
@@ -902,7 +907,25 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialMessage, isActive, sessionId, isConnected]);
 
-  // Safety timeout for startup overlay (30s)
+  // Close startup overlay when the AI actually starts processing — not when
+  // sendMessage returns. `sessionState === 'running'` is the authoritative
+  // "AI is working on a turn" signal (set by chat:status running, broadcast
+  // by the runtime once prewarm is done). `streamingMessage` covers the case
+  // where status events were missed but content has arrived. `agentError`
+  // covers async send failures: sendMessage is fire-and-forget so the
+  // autoSend try/catch can't observe backend rejection / network errors —
+  // those land on agentError instead, and the user needs to see the error
+  // banner immediately rather than wait out the 30s safety timeout.
+  useEffect(() => {
+    if (!showStartupOverlay) return;
+    if (sessionState === 'running' || streamingMessage || agentError) {
+      setShowStartupOverlay(false);
+    }
+  }, [showStartupOverlay, sessionState, streamingMessage, agentError]);
+
+  // Safety timeout (30s) — covers prewarm failures / unresponsive backend.
+  // Prevents the overlay from sticking forever if neither sessionState nor
+  // streamingMessage ever advances.
   useEffect(() => {
     if (!showStartupOverlay) return;
     const t = setTimeout(() => setShowStartupOverlay(false), 30000);
@@ -2538,7 +2561,7 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
             <div className="absolute inset-0 z-30 flex items-center justify-center bg-[var(--paper)]/80 backdrop-blur-sm">
               <div className="flex flex-col items-center gap-3">
                 <Loader2 className="h-6 w-6 animate-spin text-[var(--ink-muted)]" />
-                <p className="text-sm text-[var(--ink-muted)]">正在启动工作区...</p>
+                <p className="text-sm text-[var(--ink-muted)]">AI 启动中</p>
               </div>
             </div>
           )}
