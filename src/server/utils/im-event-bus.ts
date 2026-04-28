@@ -45,12 +45,23 @@ export interface ImEvent {
 
 export type ImEventSubscriber = (event: ImEvent) => void;
 
+/** Optional cleanup hook fired when `clear()` force-removes a subscriber.
+ *  SSE/long-poll bridges use it to close their downstream response stream
+ *  so the remote consumer (e.g. Rust event_consumer) sees end-of-stream
+ *  and reconnects — without it `clear()` silently strands the bridge with
+ *  a live HTTP connection and a dead subscription. */
+export type ImEventOnCleared = () => void;
+
 const MAX_BUFFER = 1000;
 
 class ImEventBusImpl {
   private buffer: ImEvent[] = [];
   private nextSeq = 1;
   private subscribers = new Set<ImEventSubscriber>();
+  /** Parallel map of subscriber → onCleared cleanup hook. Kept separate
+   *  from `subscribers` so the per-event delivery loop stays a plain Set
+   *  iteration; only `clear()` and `subscribe()`/`unsubscribe` touch it. */
+  private clearedCallbacks = new Map<ImEventSubscriber, ImEventOnCleared>();
   /** Singleton "you missed events" marker. Held outside the buffer so it
    *  never competes for ring-buffer slots; emit-side eviction extends this
    *  gap's range, subscribe-side replay synthesizes it before live events. */
@@ -103,7 +114,7 @@ class ImEventBusImpl {
    *  (sinceSeq predating a `clear()`) also triggers a synthetic gap so the
    *  Rust consumer knows to re-sync rather than silently miss new events
    *  (Codex W3 fix). */
-  subscribe(sinceSeq: number, cb: ImEventSubscriber): () => void {
+  subscribe(sinceSeq: number, cb: ImEventSubscriber, onCleared?: ImEventOnCleared): () => void {
     // Cross-generation: subscriber's `since` is older than our last reset.
     // Independent from the in-generation eviction gap below — both can apply
     // (a subscriber that resumed across a reset AND inside an eviction range
@@ -140,7 +151,13 @@ class ImEventBusImpl {
       }
     }
     this.subscribers.add(cb);
-    return () => { this.subscribers.delete(cb); };
+    if (onCleared) {
+      this.clearedCallbacks.set(cb, onCleared);
+    }
+    return () => {
+      this.subscribers.delete(cb);
+      this.clearedCallbacks.delete(cb);
+    };
   }
 
   /** Latest assigned sequence (i.e. the seq of the most recently emitted
@@ -180,7 +197,21 @@ class ImEventBusImpl {
     this.buffer.length = 0;
     this.gap = null;
     this.generationStartSeq = this.nextSeq; // future events live in new generation
+    // Codex M3 follow-up: notify each subscriber that it was force-cleared
+    // before dropping it. Long-poll / SSE bridges (e.g. /api/im/events
+    // consumed by the Rust event_consumer) own a live HTTP response stream
+    // that survives `clear()` — without an explicit signal they keep
+    // heart-beating on a now-dead subscription, and Rust's ReplyRouter
+    // never receives the next turn's events. The cleanup hook closes the
+    // stream so the consumer reconnects with `since=<lastSeq>`; subscribe()
+    // then synthesizes a session-reset gap so the consumer knows it missed
+    // events from the prior generation.
+    const cleanups = Array.from(this.clearedCallbacks.values());
     this.subscribers.clear();
+    this.clearedCallbacks.clear();
+    for (const onCleared of cleanups) {
+      try { onCleared(); } catch (e) { console.error('[im-bus] cleared cb threw', e); }
+    }
     // nextSeq is intentionally NOT reset.
   }
 }

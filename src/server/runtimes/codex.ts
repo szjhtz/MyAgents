@@ -204,8 +204,12 @@ class JsonRpcClient {
       if (handler) {
         this.pending.delete(id);
         if (msg.error) {
-          const err = msg.error as { code: number; message: string };
-          handler.reject(new Error(`RPC error ${err.code}: ${err.message}`));
+          const err = msg.error as { code: number; message: string; data?: { details?: string } };
+          // Carry err.data.details into the message so downstream stale-session
+          // detection (and humans reading logs) see the actionable diagnostic,
+          // not just the generic JSON-RPC "Internal error" wrapper.
+          const details = typeof err.data?.details === 'string' ? `: ${err.data.details}` : '';
+          handler.reject(new Error(`RPC error ${err.code}: ${err.message}${details}`));
         } else {
           handler.resolve(msg.result);
         }

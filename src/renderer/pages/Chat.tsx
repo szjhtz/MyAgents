@@ -48,6 +48,7 @@ import { patchAgentConfig, getAgentById } from '@/config/services/agentConfigSer
 import type { AgentConfig } from '../../shared/types/agent';
 import { BrowserPanelContext } from '@/context/BrowserPanelContext';
 import { CUSTOM_EVENTS, isPendingSessionId } from '../../shared/constants';
+import type { CapabilityInitialSelect } from '../../shared/skillsTypes';
 import { CC_MODELS, CC_PERMISSION_MODES, CODEX_PERMISSION_MODES, GEMINI_PERMISSION_MODES, getDefaultRuntimePermissionMode, getRuntimePermissionModes } from '../../shared/types/runtime';
 import type { RuntimeType, RuntimeDetections, RuntimeConfig } from '../../shared/types/runtime';
 import type { InitialMessage } from '@/types/tab';
@@ -589,13 +590,15 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
   const [workspaceRefreshTrigger, setWorkspaceRefreshTrigger] = useState(0);
 
   // Enabled sub-agents for sidebar display
-  const [enabledAgents, setEnabledAgents] = useState<Record<string, { description: string; prompt?: string; model?: string; scope?: 'user' | 'project' }> | undefined>();
+  const [enabledAgents, setEnabledAgents] = useState<Record<string, { description: string; prompt?: string; model?: string; scope?: 'user' | 'project'; folderName?: string }> | undefined>();
   // Enabled skills/commands for sidebar display
   const [enabledSkills, setEnabledSkills] = useState<Array<{ name: string; description: string; scope?: 'user' | 'project'; folderName?: string }>>([]);
-  const [enabledCommands, setEnabledCommands] = useState<Array<{ name: string; description: string; scope?: 'user' | 'project' }>>([]);
+  const [enabledCommands, setEnabledCommands] = useState<Array<{ name: string; description: string; scope?: 'user' | 'project'; fileName?: string }>>([]);
   const [globalSkillFolderNames, setGlobalSkillFolderNames] = useState<Set<string>>(new Set());
   // Initial tab for workspace config panel (set when opening from capabilities panel)
   const [workspaceConfigInitialTab, setWorkspaceConfigInitialTab] = useState<WorkspaceTab | undefined>();
+  // Initial item selection — when set, WorkspaceConfigPanel opens already showing that item's detail.
+  const [workspaceConfigInitialSelect, setWorkspaceConfigInitialSelect] = useState<CapabilityInitialSelect | undefined>();
 
   // Agent Runtime detection (v0.1.59)
   const [runtimeDetections, setRuntimeDetections] = useState<RuntimeDetections>({
@@ -808,8 +811,11 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
     chatInputRef.current?.insertSlashCommand(command);
   }, []);
 
-  const handleOpenSettings = useCallback(() => {
+  const handleOpenSettings = useCallback((initialSelect?: CapabilityInitialSelect) => {
+    // All three kinds (skill/command/agent) live under the 'skills' tab in the
+    // project workspace — that tab renders SkillsCommandsList AND WorkspaceAgentsList.
     setWorkspaceConfigInitialTab('skills');
+    setWorkspaceConfigInitialSelect(initialSelect);
     setShowWorkspaceConfig(true);
   }, []);
 
@@ -843,9 +849,13 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
         // 2. Compute effective values BEFORE setState (avoid stale closure)
         // External runtime: read from runtimePermissionMode (CC/Codex modes), not permissionMode (builtin)
         const effectivePermission = (initialMessage.permissionMode ?? (isExternalRuntime ? runtimePermissionMode : permissionMode)) as PermissionMode;
-        // External runtime uses runtimeModel as fallback (not selectedModel which is the builtin model).
-        // When both are undefined (user picked "默认"), pass undefined to let the CLI use its own default.
-        const effectiveModel = initialMessage.model ?? (isExternalRuntime ? runtimeModel : selectedModel);
+        // PRD 0.2.3: builtinSelection.model is the builtin runtime model (paired with providerId by type system);
+        // runtimeModel is the external runtime model (no provider). Picking the wrong fallback used to allow
+        // (provider X, model Y) mismatches — now the type narrows it to one or the other.
+        const builtinSel = initialMessage.builtinSelection;
+        const effectiveModel = isExternalRuntime
+          ? (initialMessage.runtimeModel ?? runtimeModel)
+          : (builtinSel?.model ?? selectedModel);
 
         // 3. Update local UI state to reflect Launcher choices
         if (initialMessage.permissionMode) {
@@ -857,27 +867,23 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
             setPermissionMode(initialMessage.permissionMode);
           }
         }
-        if (initialMessage.model) {
-          // External runtime (Codex/CC) uses runtimeModel; builtin uses selectedModel.
-          // Setting the wrong one causes the model from Launcher to be ignored on subsequent messages.
-          if (isExternalRuntime) {
-            setRuntimeModel(initialMessage.model);
-          } else {
-            setSelectedModel(initialMessage.model);
-          }
-        }
-        if (initialMessage.providerId) {
-          setSelectedProviderId(initialMessage.providerId);
+        if (isExternalRuntime) {
+          if (initialMessage.runtimeModel) setRuntimeModel(initialMessage.runtimeModel);
+        } else if (builtinSel) {
+          // Apply the paired (provider, model) atomically — type system guarantees both present.
+          setSelectedProviderId(builtinSel.providerId);
+          setSelectedModel(builtinSel.model);
           providerInitRef.current = true; // suppress deferred provider-change effect
         }
 
-        // 4. Build providerEnv locally from providerId (never stored in Tab state for security)
-        const provider = initialMessage.providerId
-          ? providers.find(p => p.id === initialMessage.providerId) ?? currentProvider
+        // 4. Build providerEnv locally from providerId (never stored in Tab state for security).
+        // For builtin runtime, prefer the paired selection's provider; otherwise use currentProvider.
+        const provider = builtinSel
+          ? providers.find(p => p.id === builtinSel.providerId) ?? currentProvider
           : currentProvider;
         const providerEnv = buildProviderEnv(provider);
 
-        // 5. Send message
+        // 5. Send message (fire-and-forget — resolves before backend turn actually starts)
         setIsLoading(true);
         scrollToBottom();
         await sendMessage(
@@ -888,8 +894,13 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
           isExternalRuntime ? undefined : providerEnv
         );
 
-        // 6. Hide overlay
-        setShowStartupOverlay(false);
+        // 6. Mark initialMessage consumed. DO NOT close overlay here:
+        //    sendMessage() returns immediately (fire-and-forget), and on external
+        //    runtimes (gemini/codex) the backend is still in prewarm — sessionState
+        //    stays `idle` and isLoading gets cleared by the prewarm chat:init event.
+        //    Closing the overlay now produced the "stable idle" gap the user saw.
+        //    Overlay closure is now driven by the dedicated effect below — it waits
+        //    for the AI to actually start (sessionState='running' or streaming).
         onInitialMessageConsumedRef.current?.();
       } catch (err) {
         console.error('[Chat] Auto-send failed:', err);
@@ -902,7 +913,25 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialMessage, isActive, sessionId, isConnected]);
 
-  // Safety timeout for startup overlay (30s)
+  // Close startup overlay when the AI actually starts processing — not when
+  // sendMessage returns. `sessionState === 'running'` is the authoritative
+  // "AI is working on a turn" signal (set by chat:status running, broadcast
+  // by the runtime once prewarm is done). `streamingMessage` covers the case
+  // where status events were missed but content has arrived. `agentError`
+  // covers async send failures: sendMessage is fire-and-forget so the
+  // autoSend try/catch can't observe backend rejection / network errors —
+  // those land on agentError instead, and the user needs to see the error
+  // banner immediately rather than wait out the 30s safety timeout.
+  useEffect(() => {
+    if (!showStartupOverlay) return;
+    if (sessionState === 'running' || streamingMessage || agentError) {
+      setShowStartupOverlay(false);
+    }
+  }, [showStartupOverlay, sessionState, streamingMessage, agentError]);
+
+  // Safety timeout (30s) — covers prewarm failures / unresponsive backend.
+  // Prevents the overlay from sticking forever if neither sessionState nor
+  // streamingMessage ever advances.
   useEffect(() => {
     if (!showStartupOverlay) return;
     const t = setTimeout(() => setShowStartupOverlay(false), 30000);
@@ -1206,7 +1235,7 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
   // Load enabled agents and sync to backend
   const loadAndSyncAgents = useCallback(async () => {
     try {
-      const response = await apiGet<{ success: boolean; agents: Record<string, { description: string; prompt: string; model?: string; scope?: 'user' | 'project' }> }>('/api/agents/enabled');
+      const response = await apiGet<{ success: boolean; agents: Record<string, { description: string; prompt: string; model?: string; scope?: 'user' | 'project'; folderName?: string }> }>('/api/agents/enabled');
       if (response.success && response.agents) {
         setEnabledAgents(response.agents);
         // Skip push when joining existing sidecar to avoid overwriting session config
@@ -1230,10 +1259,10 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
   // Load skills/commands for sidebar display
   const loadSkillsAndCommands = useCallback(async () => {
     try {
-      const response = await apiGet<{ success: boolean; commands: Array<{ name: string; description: string; source: string; scope?: 'user' | 'project'; folderName?: string }>; globalSkillFolderNames?: string[] }>('/api/commands');
+      const response = await apiGet<{ success: boolean; commands: Array<{ name: string; description: string; source: string; scope?: 'user' | 'project'; folderName?: string; fileName?: string }>; globalSkillFolderNames?: string[] }>('/api/commands');
       if (response.success && response.commands) {
         setEnabledSkills(response.commands.filter(c => c.source === 'skill').map(c => ({ name: c.name, description: c.description, scope: c.scope, folderName: c.folderName })));
-        setEnabledCommands(response.commands.filter(c => c.source === 'custom').map(c => ({ name: c.name, description: c.description, scope: c.scope })));
+        setEnabledCommands(response.commands.filter(c => c.source === 'custom').map(c => ({ name: c.name, description: c.description, scope: c.scope, fileName: c.fileName })));
         setGlobalSkillFolderNames(new Set(response.globalSkillFolderNames || []));
       }
     } catch (err) {
@@ -2141,6 +2170,26 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
     void handleSendMessageRef.current(prompt);
   }, [formatQuote]);
 
+  // File preview「引用文件」: append `@<path> ` to chat input. Token-format matches existing
+  // `@file` mention (server's fallback-path collector treats literal `@path` as a file
+  // reference). Path normalised to POSIX so Windows backslashes don't reach the model —
+  // the @-mention parser and downstream tools both expect forward-slash paths.
+  const handleQuoteFile = useCallback((path: string) => {
+    const posix = path.replace(/\\/g, '/');
+    chatInputRef.current?.appendReferenceToken(`@${posix}`);
+  }, []);
+
+  // File preview selection-quote: append `@<path>#L<start>[-L<end>] ` to chat input.
+  // GitHub-permalink syntax — there is no server-side `#L` parsing; the model interprets
+  // the line range from prompt context (Claude is heavily exposed to GitHub permalinks in
+  // training data, so the convention reads naturally). Single-line selections collapse to
+  // `#L7` to match GitHub's convention. Path normalised to POSIX (Windows safety).
+  const handleQuoteFileSelection = useCallback((path: string, startLine: number, endLine: number) => {
+    const posix = path.replace(/\\/g, '/');
+    const range = startLine === endLine ? `L${startLine}` : `L${startLine}-L${endLine}`;
+    chatInputRef.current?.appendReferenceToken(`@${posix}#${range}`);
+  }, []);
+
   // Navigate to a specific query message (used by QueryNavigator with virtuoso)
   // Uses messagesRef to avoid invalidating the callback on every streaming token update
   const handleNavigateToQuery = useCallback((messageId: string) => {
@@ -2538,7 +2587,7 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
             <div className="absolute inset-0 z-30 flex items-center justify-center bg-[var(--paper)]/80 backdrop-blur-sm">
               <div className="flex flex-col items-center gap-3">
                 <Loader2 className="h-6 w-6 animate-spin text-[var(--ink-muted)]" />
-                <p className="text-sm text-[var(--ink-muted)]">正在启动工作区...</p>
+                <p className="text-sm text-[var(--ink-muted)]">AI 启动中</p>
               </div>
             </div>
           )}
@@ -2656,6 +2705,8 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
             onInsertReference={handleInsertReference}
             refreshTrigger={workspaceRefreshTrigger}
             onFilePreviewExternal={isSplitViewEnabled && !isNarrowLayout ? handleSplitFilePreview : undefined}
+            onQuoteFile={handleQuoteFile}
+            onQuoteSelection={handleQuoteFileSelection}
           >
             <MessageList
               historyMessages={historyMessages}
@@ -2794,6 +2845,8 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
               refreshTrigger={toolCompleteCount + workspaceRefreshTrigger}
               isTauriDragActive={isTauriDragging && activeZoneId === 'directory-panel'}
               onInsertReference={handleInsertReference}
+              onQuoteFile={handleQuoteFile}
+              onQuoteSelection={handleQuoteFileSelection}
               enabledAgents={enabledAgents}
               enabledSkills={enabledSkills}
               enabledCommands={enabledCommands}
@@ -2953,6 +3006,8 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
                       setFullscreenPreviewFile(file);
                     }}
                     onSwitchToBrowser={browserUrl ? handleEditorSwitchToBrowser : undefined}
+                    onQuoteFile={handleQuoteFile}
+                    onQuoteSelection={handleQuoteFileSelection}
                   />
                 </Suspense>
               </div>
@@ -3046,6 +3101,8 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
             path={fullscreenPreviewFile.path}
             onClose={() => setFullscreenPreviewFile(null)}
             onSaved={() => setWorkspaceRefreshTrigger(prev => prev + 1)}
+            onQuoteFile={handleQuoteFile}
+            onQuoteSelection={handleQuoteFileSelection}
           />
         </Suspense>
       )}
@@ -3057,11 +3114,13 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
           onClose={() => {
             setShowWorkspaceConfig(false);
             setWorkspaceConfigInitialTab(undefined);
+            setWorkspaceConfigInitialSelect(undefined);
             // Refresh capabilities data in case settings were changed
             setWorkspaceRefreshTrigger(prev => prev + 1);
           }}
           refreshKey={workspaceRefreshKey}
           initialTab={workspaceConfigInitialTab}
+          initialSelect={workspaceConfigInitialSelect}
           onRequestInit={handleRequestInitFromSettings}
         />
       )}

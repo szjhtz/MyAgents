@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::{Child, Stdio};
 #[cfg(windows)]
 use std::process::Command;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(unix)]
 use std::sync::Once;
@@ -618,30 +618,116 @@ pub struct SidecarManager {
     session_activations: HashMap<String, SessionActivation>,
     /// Port counter for allocation (starts from BASE_PORT)
     port_counter: AtomicU16,
-    /// Session ID -> generation counter. Incremented each time a sidecar is created
-    /// for a session. Used to detect replacements during lock-gap HTTP health checks.
+    /// Session ID -> generation counter. The generation is the unique instance
+    /// ID of the *current* sidecar bound to that session_id, drawn from the
+    /// process-global `instance_counter` below. Used both for lock-gap HTTP
+    /// health-check race detection AND for IM event-consumer cancellation
+    /// matching (consumer entries store the generation they were spawned
+    /// against; broadcast stop events carry the generation; matching is
+    /// reuse-safe because the global counter never produces the same value
+    /// twice).
     sidecar_generations: HashMap<String, u64>,
+    /// Process-global monotonic counter for sidecar instance IDs. Every
+    /// `insert_sidecar` draws a fresh value via `fetch_add`. Crucially, this
+    /// is **never** reset — even when `sidecar_generations.clear()` runs in
+    /// `stop_all` or `clear_generation` removes one entry, the counter
+    /// keeps climbing. Without this, a session_id reused after idle release
+    /// (IM idle collector preserves session_id by design) would get
+    /// generation=1 again and a stale stop event for the previous instance
+    /// would falsely match. With this, IDs are unique for the lifetime of
+    /// the process and reuse is impossible.
+    instance_counter: AtomicU64,
+    /// Broadcast sender — emits `(session_id, generation)` whenever a
+    /// SessionSidecar is removed (last owner released, runtime drift kill,
+    /// explicit stop, app shutdown). The generation is critical: a remove +
+    /// recreate under the same `session_id` (e.g. IM idle collector preserves
+    /// session_id, next message rebuilds sidecar) bumps generation, so a
+    /// stale stop event from the previous instance no longer matches the
+    /// fresh consumer entry. Used by IM ImEventConsumer registry to cancel
+    /// its long-poll loop in lockstep with sidecar lifecycle, instead of
+    /// letting orphan consumers hammer a dead port until the 60s idle
+    /// collector or app shutdown notices.
+    /// Channel capacity 64 — one event per sidecar removal; multi-IM setups
+    /// have at most a few simultaneous removals during shutdown bursts; on
+    /// `Lagged` subscribers do a full reconciliation sweep against
+    /// `live_sidecar_set()`.
+    stop_events: tokio::sync::broadcast::Sender<(String, u64)>,
 }
 
 impl SidecarManager {
     pub fn new() -> Self {
+        // Drop the initial receiver immediately — subscribers grab their own via
+        // `subscribe_stop_events()`. broadcast::Sender keeps working even with
+        // zero receivers (send returns Err which we discard at call sites).
+        let (stop_events, _drop_initial_rx) = tokio::sync::broadcast::channel(64);
         Self {
             sidecars: HashMap::new(),
             instances: HashMap::new(),
             session_activations: HashMap::new(),
             port_counter: AtomicU16::new(BASE_PORT),
             sidecar_generations: HashMap::new(),
+            // Start at 1 so callers using `0` as an "unknown / not present"
+            // placeholder (see IM `sidecar_generation_initial.unwrap_or(0)`)
+            // never collide with a real allocated generation.
+            instance_counter: AtomicU64::new(1),
+            stop_events,
         }
     }
 
-    /// Increment and return the generation counter for a session.
-    fn next_generation(&mut self, session_id: &str) -> u64 {
-        let gen = self.sidecar_generations.entry(session_id.to_string()).or_insert(0);
-        *gen += 1;
-        *gen
+    /// Subscribe to sidecar-stop events. The returned receiver yields
+    /// `(session_id, generation)` of each removed SessionSidecar so the
+    /// subscriber can clean up any per-session state it owns (e.g. IM
+    /// ImEventConsumer registry). Generation distinguishes a fresh sidecar
+    /// from a previous one bound to the same session_id.
+    pub fn subscribe_stop_events(&self) -> tokio::sync::broadcast::Receiver<(String, u64)> {
+        self.stop_events.subscribe()
     }
 
-    /// Get the current generation counter for a session (0 if never created).
+    /// Snapshot of currently-live `(session_id, generation)` pairs. Subscribers
+    /// use this to recover from broadcast `Lagged` (skipped events) by
+    /// reconciling: any consumer entry whose `(session_id, generation)` is
+    /// *not* in this set was either stopped during the lag window or was
+    /// never installed against a live sidecar — either way, cancel it.
+    pub fn live_sidecar_set(&self) -> HashSet<(String, u64)> {
+        self.sidecars
+            .keys()
+            .map(|sid| {
+                let gen = self.sidecar_generations.get(sid).copied().unwrap_or(0);
+                (sid.clone(), gen)
+            })
+            .collect()
+    }
+
+    /// Public read of the generation (= unique instance ID) for a session,
+    /// or `None` if no sidecar is currently bound to that session_id.
+    /// Returning `Option` (not 0) makes "never existed" explicit at call sites.
+    pub fn generation_for(&self, session_id: &str) -> Option<u64> {
+        self.sidecar_generations.get(session_id).copied()
+    }
+
+    /// True if a sidecar with this `(session_id, generation)` is currently
+    /// in `sidecars` AND its recorded generation matches. Stronger predicate
+    /// than `generation_for` alone: catches the case where the manager has a
+    /// stale generation entry but the sidecar HashMap entry is gone.
+    /// Used by IM `ensure_im_consumer` final-check.
+    pub fn is_live(&self, session_id: &str, generation: u64) -> bool {
+        self.sidecars.contains_key(session_id)
+            && self.sidecar_generations.get(session_id).copied() == Some(generation)
+    }
+
+    /// Allocate the next instance ID and stash it as this session's current
+    /// generation. The ID comes from the process-global atomic counter, so
+    /// it is unique for the whole process lifetime — repeated sidecars under
+    /// the same session_id (e.g. IM idle release + rebuild) get distinct
+    /// generations, which is what makes IM event-consumer reuse race-free.
+    fn next_generation(&mut self, session_id: &str) -> u64 {
+        let id = self.instance_counter.fetch_add(1, Ordering::SeqCst);
+        self.sidecar_generations.insert(session_id.to_string(), id);
+        id
+    }
+
+    /// Get the current generation counter for a session (0 if never created
+    /// or has been cleared). 0 is never a real generation (counter starts at 1).
     fn current_generation(&self, session_id: &str) -> u64 {
         self.sidecar_generations.get(session_id).copied().unwrap_or(0)
     }
@@ -733,6 +819,23 @@ impl SidecarManager {
             self.sidecars.len(),
             self.instances.len()
         );
+        // Broadcast stop for each live sidecar before clearing — covers callers
+        // that invoke stop_all while IM bots are still running (e.g. exposed
+        // `cmd_stop_all_sidecars` Tauri command). The app-exit path normally
+        // signals IM shutdown_rx first, but we don't rely on caller ordering.
+        let to_broadcast: Vec<(String, u64)> = self
+            .sidecars
+            .keys()
+            .map(|sid| {
+                (
+                    sid.clone(),
+                    self.sidecar_generations.get(sid).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        for ev in to_broadcast {
+            let _ = self.stop_events.send(ev);
+        }
         self.sidecars.clear(); // Session-centric Sidecars (Drop kills processes)
         self.instances.clear(); // Global Sidecar (Drop kills process)
         self.session_activations.clear();
@@ -856,8 +959,19 @@ impl SidecarManager {
 
     /// Remove a sidecar. Does NOT clear the generation counter — it must remain
     /// queryable across lock gaps (e.g. during HTTP health check windows).
+    /// Broadcasts `(session_id, generation)` on `stop_events` when the entry
+    /// actually existed, so subscribers (IM event-consumer registry) can
+    /// cancel resources tied to *this specific* sidecar instance — a stale
+    /// event from a previous instance won't match a freshly-recreated one.
     fn remove_sidecar(&mut self, session_id: &str) -> Option<SessionSidecar> {
-        self.sidecars.remove(session_id)
+        let gen = self.current_generation(session_id);
+        let removed = self.sidecars.remove(session_id);
+        if removed.is_some() {
+            // send() returns Err only when there are no subscribers — fine, we
+            // don't require anyone listening for sidecar removal to be valid.
+            let _ = self.stop_events.send((session_id.to_string(), gen));
+        }
+        removed
     }
 
     /// Runtime drift helper for the IM router (v0.1.66).
@@ -918,7 +1032,10 @@ impl SidecarManager {
         if let Some(sidecar) = self.sidecars.get_mut(session_id) {
             let _ = sidecar.process.kill();
         }
-        self.sidecars.remove(session_id);
+        // Go through remove_sidecar() so stop_events is broadcast — a runtime
+        // drift kill is exactly the kind of stop that orphan IM consumers
+        // would otherwise miss.
+        self.remove_sidecar(session_id);
         // Clear the generation counter too — the old session_id is now orphaned
         // and the peer map will never reference it again, so there's no TOCTOU
         // concern that kept it alive in the normal remove_sidecar path.
@@ -1006,6 +1123,24 @@ impl SidecarManager {
         if let Some(gen) = self.sidecar_generations.remove(old_session_id) {
             self.sidecar_generations.insert(new_session_id.to_string(), gen);
         }
+
+        // Note: deliberately NOT broadcasting a stop event for
+        // (old_session_id, generation) here, even though the manager's key
+        // has rotated. An earlier iteration did broadcast and Codex r4
+        // caught the race: Message B may have already reused the OLD
+        // ImConsumerHandle and registered an in-flight ReplySlot before the
+        // upgrade (Message A's terminal triggered it); cancelling the old
+        // entry mid-flight strands B's slot in a router whose consumer was
+        // just terminated.
+        //
+        // The correctness invariant is upheld instead via
+        // `ensure_im_consumer`'s reuse-path `is_live` check: the next message
+        // (post-upgrade) sees `is_live(old_sid, gen) == false`, falls through
+        // to cancel + respawn against new_session_id. In-flight slots on the
+        // old entry continue draining naturally — the underlying sidecar
+        // process is alive, SSE keeps flowing, terminal events still reach
+        // the old router. After all slots terminate, the next ensure_im_consumer
+        // call replaces the entry. No leak, no premature cancellation.
 
         // 3. Upgrade in session_activations HashMap
         if let Some(mut activation) = self.session_activations.remove(old_session_id) {

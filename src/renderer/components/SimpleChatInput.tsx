@@ -16,7 +16,7 @@ import { isImageFile, isImageMimeType, ALLOWED_IMAGE_MIME_TYPES } from '../../sh
 import type { QueuedMessageInfo } from '@/types/queue';
 import { CUSTOM_EVENTS } from '../../shared/constants';
 import { isDebugMode } from '@/utils/debug';
-import { stripMacFunctionKeys } from '@/utils/macFunctionKeyFilter';
+import { renameIfBareClipboardImage } from '@/utils/clipboardImage';
 import { isProviderAvailable } from '@/config/configService';
 import { modelSupportsModality } from '@/config/services/providerService';
 import RuntimeSelector from '@/components/RuntimeSelector';
@@ -183,6 +183,12 @@ export interface SimpleChatInputHandle {
   processDroppedFilePaths?: (paths: string[]) => Promise<void>;
   /** Insert @references at cursor position or end of input */
   insertReferences: (paths: string[]) => void;
+  /** Append a single reference token (e.g. `@path` or `@path#L7-L10`) to the END of input
+   *  with auto-padded leading space and a guaranteed trailing space. Cursor lands at end,
+   *  textarea scrolls to show the appended token. Used by file preview "引用文件" /
+   *  selection-quote — distinct from `insertReferences` which inserts at cursor without
+   *  trailing space. */
+  appendReferenceToken: (token: string) => void;
   /** Insert a /slash-command at cursor position or end of input */
   insertSlashCommand: (command: string) => void;
   /** Set the input value directly (used for restoring content after cron stop) */
@@ -590,28 +596,40 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
       }
     }
 
-    // Modality warning at the input boundary. Sidecar still strips images on
-    // send (authoritative) — this is purely UX so the user knows the moment
-    // they paste/drop. We still queue the images into the UI: the user can
-    // see them in the message bubble post-send, can switch to a multimodal
-    // model and re-send, etc. One toast per batch (paste of 5 images = 1
-    // toast, not 5).
+    // Modality fallback at the input boundary (PRD prd_0.2.3_image_modality_file_fallback.md).
+    // When the model lacks image support, we re-route the image files into
+    // the regular non-image upload path: write to <agentDir>/myagents_files/
+    // and insert `@<path>` references into the input. The sidecar's
+    // `enqueueUserMessage` does the same thing as a backstop (covers IM Bot
+    // and any race where the model is changed between paste and send), but
+    // doing it here too makes the UX honest — what the user sees in the
+    // input is exactly what gets sent.
     //
-    // Skip the toast for external runtimes (Claude Code CLI / Codex / Gemini
-    // CLI). The Sidecar modality gate lives only in the builtin
-    // `enqueueUserMessage` path; external runtimes go through
-    // `external-session.ts` which has no filter. Showing "will be filtered"
-    // there is a false promise (no filter actually runs) AND a false warning
-    // for runtimes whose models DO accept images (Gemini 2.5 / 3 are
-    // multimodal). Coverage of external runtimes is deliberate V1 scope-skip.
-    if (
+    // External runtimes (Claude Code CLI / Codex / Gemini CLI) are exempt:
+    // they have no `inputModalities` metadata and treat all models as
+    // multimodal-capable. Forcing fallback there would be a false negative
+    // for runtimes whose models DO accept images (Gemini 2.5 / 3).
+    const fallbackImagesToFiles =
       imageFiles.length > 0 &&
       !isExternalRuntime &&
-      !modelSupportsModality(provider, currentModelId, 'image')
-    ) {
-      toastRef.current.warning(
-        `${getCurrentModelLabel(provider, currentModelId)} 不支持图片输入，发送时会自动过滤，仅文本送达`,
+      !modelSupportsModality(provider, currentModelId, 'image');
+
+    // Capture the user-intended file count BEFORE merging fallback images
+    // into otherFiles. The downstream success toast ("已添加 N 个文件到工作区")
+    // should only count files the user actually meant to drop in — fallback
+    // images already get their own info toast and double-toasting feels noisy.
+    const userIntendedFileCount = otherFiles.length;
+
+    if (fallbackImagesToFiles) {
+      toastRef.current.info(
+        '当前模型不支持图片输入，已转为文件存入工作区供模型读取',
       );
+      // Bare clipboard names ("image.png" / "") get a timestamped name so
+      // pasted screenshots don't collide on disk into image_1.png, image_2.png.
+      for (const img of imageFiles) {
+        otherFiles.push(renameIfBareClipboardImage(img));
+      }
+      imageFiles.length = 0;
     }
 
     // Handle image files with the original addImage logic (no API needed)
@@ -677,7 +695,13 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
           });
         }
 
-        toastRef.current.success(`已添加 ${result.files.length} 个文件到工作区`);
+        // Suppress the generic "已添加 N 个文件" success toast when the entire
+        // batch came from fallback — the info toast above already explains
+        // what happened and to the user a literal screenshot paste is not
+        // an intentional "add file to workspace" action.
+        if (userIntendedFileCount > 0) {
+          toastRef.current.success(`已添加 ${userIntendedFileCount} 个文件到工作区`);
+        }
 
         // Refresh workspace to show new files
         onWorkspaceRefresh?.();
@@ -714,17 +738,27 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
       }
     }
 
-    // Modality warning at input boundary (mirrors processDroppedFiles).
-    // Sidecar still strips on send; this is purely UX. External runtimes are
-    // skipped — see processDroppedFiles for the rationale.
-    if (
+    // Modality fallback at input boundary (mirrors processDroppedFiles —
+    // see the comment there for the full rationale and PRD reference). For
+    // Tauri-style absolute path drops we re-route the image paths into
+    // /api/files/copy alongside the non-image paths; original filenames are
+    // already real, so no rename is needed.
+    const fallbackImagesToFiles =
       imagePaths.length > 0 &&
       !isExternalRuntime &&
-      !modelSupportsModality(provider, currentModelId, 'image')
-    ) {
-      toastRef.current.warning(
-        `${getCurrentModelLabel(provider, currentModelId)} 不支持图片输入，发送时会自动过滤，仅文本送达`,
+      !modelSupportsModality(provider, currentModelId, 'image');
+
+    // See processDroppedFiles for the rationale: count only files the user
+    // actively dropped before merging fallback images, so the success toast
+    // doesn't double up with the fallback info toast.
+    const userIntendedPathCount = otherPaths.length;
+
+    if (fallbackImagesToFiles) {
+      toastRef.current.info(
+        '当前模型不支持图片输入，已转为文件存入工作区供模型读取',
       );
+      otherPaths.push(...imagePaths);
+      imagePaths.length = 0;
     }
 
     // Handle image files - read via backend API and add as image attachments
@@ -823,11 +857,15 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
           });
         }
 
-        // Show appropriate message
-        if (successfulCopies.length < otherPaths.length) {
-          toastRef.current.warning(`已添加 ${successfulCopies.length}/${otherPaths.length} 个文件到工作区`);
-        } else {
-          toastRef.current.success(`已添加 ${successfulCopies.length} 个文件到工作区`);
+        // Show appropriate message — but only count user-intended paths.
+        // Fallback images already got their own info toast above; layering
+        // a generic "已添加 N 个文件" on top would be redundant.
+        if (userIntendedPathCount > 0) {
+          if (successfulCopies.length < otherPaths.length) {
+            toastRef.current.warning(`已添加 ${successfulCopies.length}/${otherPaths.length} 个文件到工作区`);
+          } else {
+            toastRef.current.success(`已添加 ${userIntendedPathCount} 个文件到工作区`);
+          }
         }
 
         // Refresh workspace to show new files
@@ -870,6 +908,26 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
     }, 0);
   }, [textareaRef]);
 
+  // Append a reference token to the END of input with leading-space padding and
+  // guaranteed trailing space. Used by file-preview 「引用文件」/ 「引用」 selection.
+  // Distinct from `insertReferences` (insert at cursor, no trailing space) — appending
+  // and trailing-space matter for the file-preview UX where the user always wants a
+  // ready-to-type position right after the token.
+  const appendReferenceToken = useCallback((token: string) => {
+    if (!token) return;
+    const currentInput = inputValueRef.current;
+    const needsSpaceBefore = currentInput.length > 0 && !/\s$/.test(currentInput);
+    const newValue = `${currentInput}${needsSpaceBefore ? ' ' : ''}${token} `;
+    setInputValue(newValue);
+    setTimeout(() => {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      ta.focus();
+      ta.setSelectionRange(newValue.length, newValue.length);
+      ta.scrollTop = ta.scrollHeight;
+    }, 0);
+  }, [textareaRef]);
+
   // Insert /slash-command at cursor position or end of input
   const insertSlashCommand = useCallback((command: string) => {
     if (!command.trim()) return;
@@ -902,12 +960,13 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
     processDroppedFiles,
     processDroppedFilePaths,
     insertReferences,
+    appendReferenceToken,
     insertSlashCommand,
     setValue,
     setImages,
     focus: () => textareaRef.current?.focus(),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- textareaRef is stable
-  }), [processDroppedFiles, processDroppedFilePaths, insertReferences, insertSlashCommand, setValue]);
+  }), [processDroppedFiles, processDroppedFilePaths, insertReferences, appendReferenceToken, insertSlashCommand, setValue]);
 
   // Handle file input change
   const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
@@ -986,10 +1045,7 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
 
   // Handle text input change (detect @ and / and backspace)
   const handleInputChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    // Strip macOS function-key private-use codepoints (-) that
-    // WebKit leaks into the value when an arrow key is pressed at the
-    // textarea boundary. See utils/macFunctionKeyFilter.ts.
-    const newValue = stripMacFunctionKeys(e.target.value);
+    const newValue = e.target.value;
     const cursorPos = e.target.selectionStart;
 
     // Track current state locally to avoid stale closure issues

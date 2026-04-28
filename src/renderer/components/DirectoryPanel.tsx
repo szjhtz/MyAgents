@@ -50,6 +50,7 @@ import type {
   ExpandDirectoryResult,
 } from "../../shared/dir-types";
 import { isImageFile, isPreviewable } from "../../shared/fileTypes";
+import type { CapabilityInitialSelect } from "../../shared/skillsTypes";
 import { getFileIcon } from "@/utils/fileIcons";
 
 import { useImagePreview } from "@/context/ImagePreviewContext";
@@ -114,6 +115,12 @@ interface DirectoryPanelProps {
   isTauriDragActive?: boolean;
   /** Called when user clicks "引用" to insert @path reference into chat input */
   onInsertReference?: (paths: string[]) => void;
+  /** FilePreviewModal「引用文件」: append `@<path> ` to chat input. Forwarded to the
+   *  inline FilePreviewModal mounted by this panel (only used when `onFilePreviewExternal`
+   *  is not set — split-view path renders its own modal in Chat.tsx). */
+  onQuoteFile?: (path: string) => void;
+  /** FilePreviewModal selection-quote: append `@<path>#L<start>[-L<end>] ` to chat input. */
+  onQuoteSelection?: (path: string, startLine: number, endLine: number) => void;
   /** Enabled sub-agent definitions (from Chat.tsx) */
   enabledAgents?: Record<
     string,
@@ -122,6 +129,7 @@ interface DirectoryPanelProps {
       prompt?: string;
       model?: string;
       scope?: "user" | "project";
+      folderName?: string;
     }
   >;
   enabledSkills?: Array<{
@@ -134,13 +142,15 @@ interface DirectoryPanelProps {
     name: string;
     description: string;
     scope?: "user" | "project";
+    fileName?: string;
   }>;
   /** Set of global skill folderNames (for hiding "sync to global" on already-global skills) */
   globalSkillFolderNames?: Set<string>;
   /** Insert /command into chat input */
   onInsertSlashCommand?: (command: string) => void;
-  /** Open settings panel (skills tab) */
-  onOpenSettings?: () => void;
+  /** Open settings panel (skills tab); when invoked from "设置" on a specific item,
+   *  the receiving panel uses `initialSelect` to open that item's detail directly. */
+  onOpenSettings?: (initialSelect?: CapabilityInitialSelect) => void;
   /** Copy a project skill to global skills */
   onSyncSkillToGlobal?: (folderName: string) => void;
   /** When provided, file clicks route to this callback instead of opening the modal.
@@ -200,6 +210,8 @@ const DirectoryPanel = memo(
       onRefreshAll,
       isTauriDragActive = false,
       onInsertReference,
+      onQuoteFile,
+      onQuoteSelection,
       enabledAgents,
       enabledSkills,
       enabledCommands,
@@ -1976,6 +1988,8 @@ const DirectoryPanel = memo(
                   setPreviewError(null);
                 }}
                 onSaved={refresh}
+                onQuoteFile={onQuoteFile}
+                onQuoteSelection={onQuoteSelection}
               />
             </Suspense>
           )}

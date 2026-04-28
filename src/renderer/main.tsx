@@ -7,11 +7,17 @@ import { ConfigProvider } from './config/ConfigProvider';
 import { ToastProvider } from './components/Toast';
 import { ImagePreviewProvider } from './context/ImagePreviewContext';
 import { initFrontendLogger } from './utils/frontendLogger';
+import { installMacFunctionKeyGuard } from './utils/macFunctionKeyGuard';
 
 import './index.css';
 
 // Initialize frontend logger to capture React console logs
 initFrontendLogger();
+
+// Block macOS WKWebView's NSEvent function-key tofu leak globally —
+// see utils/macFunctionKeyGuard.ts. Must run before React mounts so the
+// document-level capture handler is attached when the first input fires.
+installMacFunctionKeyGuard();
 
 // Block native "Reload / Inspect Element" context menu in production.
 // Keep native menu for: input fields, text selection, contenteditable, links, images, media.

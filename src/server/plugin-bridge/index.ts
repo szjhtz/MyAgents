@@ -20,35 +20,53 @@ import { FeishuStreamingSession } from './streaming-adapter';
 import { createMcpHandler } from './mcp-handler';
 import { getPendingDispatch, resolvePendingDispatch, rejectPendingDispatch, clearAllPendingDispatches } from './pending-dispatch';
 import { serve as honoServe } from '@hono/node-server';
-import { readFile } from 'node:fs/promises';
+import { readFile, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { registerHooks } from 'node:module';
+import { registerHooks, createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import { join as pathJoin } from 'node:path';
 import { parseArgs } from 'util';
 
 // =============================================================================
 // Plugin compat loader — runtime patch for broken community plugins
 // =============================================================================
 // Some published OpenClaw plugins (e.g. @larksuite/openclaw-lark all versions)
-// have a build-pipeline bug: they emit CJS files (`"use strict";
-// Object.defineProperty(exports, ...); exports.X = Y`) that also reference
-// `import.meta.url` inside function bodies. Node's module classifier sees
-// `import.meta` anywhere in a .js file → forces ESM parsing → the CJS
-// `exports` global becomes undefined → ReferenceError at load.
+// have build-pipeline bugs we work around at load time. We use a sync
+// `module.registerHooks` (Node 22.15+) instead of `register()` because when a
+// CJS file calls `require(broken.js)`, Node pivots to `loadESMFromCJS` on the
+// main thread synchronously — async hooks aren't invoked on that path. Only
+// sync hooks catch it.
 //
-// Bun tolerated this silently; Node (spec-compliant) rejects it. Rather than
-// wait for every broken plugin to republish, we register a sync loader hook
-// (`module.registerHooks` — Node 22.15+) that intercepts .js files from plugin
-// node_modules trees. On detecting the CJS+import.meta mixed pattern it:
-//   1. Rewrites `fileURLToPath(import.meta.url)` → `__filename`
-//   2. Rewrites any remaining `import.meta.url` → `pathToFileURL(__filename).href`
-//   3. Forces CJS classification (`format: 'commonjs'`) so Node accepts the file
+// Patches applied (in order):
 //
-// IMPORTANT: Must use `registerHooks()` (sync), NOT `register()` (async).
-// When a CJS file calls `require(broken.js)`, Node pivots to `loadESMFromCJS`
-// synchronously on the main thread — async hooks are not invoked on that path.
-// Only sync hooks catch it.
+// 1. CJS + import.meta hybrid (every @larksuite/openclaw-lark version)
+//    Plugin emits `"use strict"; Object.defineProperty(exports, ...); exports.X = Y`
+//    AND references `import.meta.url` inside function bodies. Node's module
+//    classifier sees `import.meta` and forces ESM parsing → CJS `exports`
+//    global becomes undefined → ReferenceError at load. Bun tolerated this
+//    silently; Node (spec-compliant) rejects it.
+//      - Rewrite `fileURLToPath(import.meta.url)` → `__filename`
+//      - Rewrite remaining `import.meta.url` → `pathToFileURL(__filename).href`
+//      - Force CJS classification so Node accepts the file
+//
+// 2. Lark image/file upload `Readable.from(buffer)` (v2026.4.8 and earlier)
+//    @larksuite/openclaw-lark wraps a Buffer in `Readable.from(image)` before
+//    handing it to the Feishu SDK's `client.im.image.create()`. The SDK uses
+//    `form-data` for multipart upload, and form-data can't determine the
+//    stream length from a Readable, so the upload is sent without
+//    Content-Length and Feishu's API returns `null` ("no image_key in
+//    response"). Upstream OpenClaw fixed this by passing the Buffer directly
+//    (form-data handles Buffers fine), but the published plugin still ships
+//    the broken pattern. See:
+//      - https://github.com/larksuite/node-sdk/issues/121
+//      - openclaw/extensions/feishu/src/media.ts (upstream canonical)
 const PLUGIN_PATH_RE = /[/\\]openclaw-plugins[/\\][^/\\]+[/\\]node_modules[/\\]/;
+// Match the broken lark pattern, capturing the destination var name and the input arg name
+// so we can preserve them in the rewrite. The transform expression matches both upload sites
+// in one regex (image / file / any var). Whitespace is generous because plugins may republish
+// with prettier reformatted output.
+const LARK_BUFFER_STREAM_RE = /Buffer\.isBuffer\((\w+)\)\s*\?\s*[\w$.]+\.Readable\.from\(\1\)\s*:\s*fs\.createReadStream\(\1\)/g;
 
 registerHooks({
   load(url, context, next) {
@@ -67,13 +85,30 @@ registerHooks({
     // header comments between them can be >200 chars.
     const hasCjsExports = /^"use strict";/.test(src)
       && /\b(?:Object\.defineProperty\(exports|exports\.[\w$]+\s*=|module\.exports\s*=)/.test(src);
-    if (!hasImportMeta || !hasCjsExports) {
+    const needsCjsImportMetaPatch = hasImportMeta && hasCjsExports;
+    const needsLarkBufferPatch = LARK_BUFFER_STREAM_RE.test(src);
+    LARK_BUFFER_STREAM_RE.lastIndex = 0; // reset between calls (regex has /g flag)
+    if (!needsCjsImportMetaPatch && !needsLarkBufferPatch) {
       return next(url, context);
     }
-    const patched = src
-      .replace(/\(0,\s*[\w$.]+\.fileURLToPath\)\(import\.meta\.url\)/g, '__filename')
-      .replace(/\bfileURLToPath\(import\.meta\.url\)/g, '__filename')
-      .replace(/\bimport\.meta\.url\b/g, 'require("node:url").pathToFileURL(__filename).href');
+    let patched = src;
+    if (needsCjsImportMetaPatch) {
+      patched = patched
+        .replace(/\(0,\s*[\w$.]+\.fileURLToPath\)\(import\.meta\.url\)/g, '__filename')
+        .replace(/\bfileURLToPath\(import\.meta\.url\)/g, '__filename')
+        .replace(/\bimport\.meta\.url\b/g, 'require("node:url").pathToFileURL(__filename).href');
+    }
+    if (needsLarkBufferPatch) {
+      // `arg` is the captured input variable (image/file/buffer/etc.).
+      // The replacement matches upstream openclaw's fix: pass Buffer directly,
+      // use createReadStream only for string paths.
+      patched = patched.replace(LARK_BUFFER_STREAM_RE,
+        (_match, arg) => `(typeof ${arg} === 'string' ? fs.createReadStream(${arg}) : ${arg})`);
+    }
+    // Both patch paths target CJS files — the import.meta+CJS hybrid forces
+    // 'commonjs' to override Node's misclassification, and the lark buffer
+    // patch only matches CJS-shape `<requireBinding>.Readable.from(...)`.
+    // Returning 'commonjs' for both keeps Node's classifier consistent.
     return { format: 'commonjs', source: patched, shortCircuit: true };
   },
 });
@@ -260,23 +295,52 @@ async function loadPlugin() {
   loadedRuntime = runtime;
 
   // CRITICAL: Patch axios BEFORE importing the plugin.
-  // @larksuiteoapi/node-sdk creates `defaultHttpInstance = axios.create()` at import time.
-  // Bun's default axios http adapter has a compatibility bug where connections are silently
-  // closed after ~30s, causing all SDK API calls to hang. Setting a 10s timeout prevents
-  // the 30s hang and lets the plugin's error handling (retry/fallback) kick in faster.
+  //
+  // @larksuiteoapi/node-sdk@1.60.0 does this at import time:
+  //   const defaultHttpInstance = axios.create({ adapter: bunFetchAdapter });
+  //
+  // The bunFetchAdapter is hand-rolled to use global `fetch` for Bun runtime
+  // compatibility. But its body serialization is broken for multipart uploads:
+  //   opts.body = typeof c.data==='string' ? c.data : JSON.stringify(c.data)
+  // — when `c.data` is a FormData object (image upload, file upload), the
+  // adapter JSON-stringifies it into "{}", so Feishu's API receives a
+  // bodyless multipart request and returns null. This surfaced as
+  // "Image upload failed: no image_key in response. Response: null".
+  //
+  // We override two things on every instance the plugin creates:
+  //   1. adapter — force back to 'http' so axios uses Node's http adapter
+  //      (handles FormData / Buffer / Stream correctly via form-data lib).
+  //   2. timeout — cap at 10s so a stuck connection fails fast and the
+  //      plugin's retry/fallback path kicks in (legacy fix for a separate
+  //      Bun adapter hang bug).
+  //
+  // Why createRequire instead of `await import('axios')`:
+  // axios's package.json `exports.default` differs by environment:
+  //   "require": "./dist/node/axios.cjs"   ← what `require('axios')` loads
+  //   "default": "./index.js"              ← what `import('axios')` loads
+  // These are TWO DIFFERENT module instances with separate `create` functions.
+  // The lark SDK is CJS and does `var axios = require('axios')`, hitting the
+  // .cjs file. Patching the ESM-imported axios therefore never affects the
+  // SDK. Use createRequire to grab the same module the SDK will see, then
+  // patch THAT.
   try {
-    const axiosModule = await import(`${pluginDir}/node_modules/axios`);
-    const axios = axiosModule.default || axiosModule;
-    if (typeof axios?.create === 'function') {
-      const origCreate = axios.create.bind(axios);
-      axios.create = (...args: unknown[]) => {
+    const pluginRequire = createRequire(`${pluginDir}/`);
+    const axiosCjs = pluginRequire('axios') as { create?: (config?: unknown) => { defaults: Record<string, unknown> } };
+    if (typeof axiosCjs?.create === 'function') {
+      const origCreate = axiosCjs.create.bind(axiosCjs);
+      axiosCjs.create = (...args: unknown[]) => {
         const instance = origCreate(...(args as [Record<string, unknown>]));
-        if (!instance.defaults.timeout || instance.defaults.timeout > 10000) {
+        // Replace any custom adapter (e.g. bunFetchAdapter) with axios's built-in
+        // 'http' adapter. Multipart uploads need the http adapter — fetch-based
+        // shims drop FormData. The string form is supported by axios 1.x and
+        // resolves to the same adapter axios would auto-pick in Node.
+        instance.defaults.adapter = 'http';
+        if (!instance.defaults.timeout || (instance.defaults.timeout as number) > 10000) {
           instance.defaults.timeout = 10000;
         }
         return instance;
       };
-      console.log('[plugin-bridge] Patched axios.create with 10s timeout for Bun compatibility');
+      console.log('[plugin-bridge] Patched CJS axios.create — adapter=http, timeout=10s');
     }
   } catch {
     // axios not installed in plugin dir — no patch needed
@@ -427,10 +491,51 @@ async function loadPlugin() {
   }
   if (!capturedPlugin.sendMedia && typeof outbound?.sendMedia === 'function') {
     const outboundSendMedia = outbound.sendMedia as (params: Record<string, unknown>) => Promise<{ messageId?: string; error?: Error }>;
+    // Rust bridge.rs::send_photo / send_file POST `{ chatId, type, filename, data:base64, mimeType?, caption }`,
+    // but OpenClaw `outbound.sendMedia` expects `{ to, text, mediaUrl, mediaLocalRoots, accountId, cfg }`
+    // (mirroring sendText). Spreading params raw left every plugin field undefined → plugin
+    // logged `target=undefined`, then crashed with `Cannot read properties of undefined
+    // (reading 'trim')` deep inside its target parser.
+    //
+    // The OpenClaw outbound.sendMedia surface only accepts a `mediaUrl` (no raw buffer at this
+    // layer), so we materialize the base64 payload to a temp file and pass a bare absolute path.
+    // Why bare path instead of `file://...` URL: the WeChat plugin's `isLocalFilePath` uses
+    // `!mediaUrl.includes("://")` to detect local paths, which rejects `file://` URLs and falls
+    // through to a text-only send. Bare absolute paths satisfy both the Lark plugin
+    // (`isLocalMediaPath` → `path.isAbsolute(raw)`) and the WeChat plugin. mediaLocalRoots is
+    // scoped to just the temp dir so the plugin's path validator (post-CVE-2026-26321) doesn't
+    // refuse the read.
     capturedPlugin.sendMedia = async (params: Record<string, unknown>) => {
-      const result = await outboundSendMedia({ ...params, accountId: currentAccount.accountId || 'default', cfg: openclawCfg });
-      if (result?.error) throw result.error;
-      return { messageId: result?.messageId };
+      const chatId = params.chatId as string | undefined;
+      const filename = (params.filename as string | undefined) ?? 'file';
+      const data = params.data as string | undefined;
+      const caption = params.caption as string | null | undefined;
+      if (!chatId) {
+        throw new Error('[plugin-bridge] sendMedia: missing chatId');
+      }
+      if (!data) {
+        throw new Error('[plugin-bridge] sendMedia: missing base64 data');
+      }
+      const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_') || 'file';
+      const tmpDir = await mkdtemp(pathJoin(tmpdir(), 'plugin-bridge-media-'));
+      const tmpPath = pathJoin(tmpDir, safeName);
+      await writeFile(tmpPath, Buffer.from(data, 'base64'));
+      try {
+        const result = await outboundSendMedia({
+          to: chatId,
+          text: caption ?? undefined,
+          mediaUrl: tmpPath,
+          mediaLocalRoots: [tmpDir],
+          accountId: currentAccount.accountId || 'default',
+          cfg: openclawCfg,
+        });
+        if (result?.error) throw result.error;
+        return { messageId: result?.messageId };
+      } finally {
+        // Cleanup is best-effort — losing a temp dir on shutdown is harmless;
+        // blocking on it would slow down the response that the AI is awaiting.
+        void rm(tmpDir, { recursive: true, force: true }).catch(() => { /* ignore */ });
+      }
     };
     console.log('[plugin-bridge] Wrapped outbound.sendMedia as sendMedia handler');
   }

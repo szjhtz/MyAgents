@@ -88,6 +88,7 @@ import { scanAgents, readWorkspaceConfig, writeWorkspaceConfig, loadEnabledAgent
 import type { AgentFrontmatter, AgentMeta, AgentWorkspaceConfig } from '../shared/agentTypes';
 import type { McpServerDefinition } from '../renderer/config/types';
 import { ensureDirSync, ensureDir, isDirEntry } from './utils/fs-utils';
+import { writeBase64FilesToAgentDir } from './utils/workspace-files';
 import {
   setCronTaskContext,
   clearCronTaskContext,
@@ -252,6 +253,7 @@ import {
   setProxyConfig,
   initSocksBridgeFromEnv,
   getHistoricalSessionMessages,
+  ensureSdkMcpInSync,
   type ProviderEnv,
 } from './agent-session';
 import { getHomeDirOrNull, isSkillBlockedOnPlatform } from './utils/platform';
@@ -3935,35 +3937,8 @@ async function main() {
             return jsonResponse({ success: false, error: 'Invalid target directory' }, 400);
           }
 
-          // Ensure target directory exists
-          await ensureDir(resolvedTarget);
-
-          const saved: string[] = [];
-
-          for (const file of files) {
-            // Sanitize filename
-            const safeName = file.name.replace(/[<>:"/\\|?*]/g, '_');
-
-            // Generate unique name if file exists
-            let finalName = safeName;
-            let counter = 1;
-            const ext = extname(safeName);
-            const base = basename(safeName, ext);
-            while (existsSync(join(resolvedTarget, finalName))) {
-              finalName = `${base}_${counter}${ext}`;
-              counter++;
-            }
-
-            const destination = join(resolvedTarget, finalName);
-
-            // Decode base64 and write file
-            const buffer = Buffer.from(file.content, 'base64');
-            await writeFile(destination, buffer);
-
-            saved.push(relative(currentAgentDir, destination));
-          }
-
-          return jsonResponse({ success: true, files: saved });
+          const written = await writeBase64FilesToAgentDir(files, resolvedTarget, currentAgentDir);
+          return jsonResponse({ success: true, files: written.map(w => w.relativePath) });
         } catch (error) {
           console.error('[api/files/import-base64] Error:', error);
           return jsonResponse(
@@ -5483,6 +5458,7 @@ async function main() {
                     source: 'custom',
                     scope,
                     path: filePath,
+                    fileName,  // Disk identifier — needed to route to detail panel
                   });
                 } catch (err) {
                   console.warn(`[api/commands] Error reading command ${file}:`, err);
@@ -8116,9 +8092,27 @@ async function main() {
                 sourceType: bridgeSourceType,
               });
             }
+
+            // After IM context-injected MCPs (im-media / im-bridge-tools) are set,
+            // sync them into the live SDK so its tool list reflects them. Without this,
+            // the pre-warmed SDK (started by heartbeat before any IM message) keeps a
+            // stale mcpServers config and the AI claims tools like im-media__send_media
+            // are "disconnected".
+            //
+            // Position note: called BEFORE setInteractionScenario so the pre-warm's
+            // current scenario (typically 'desktop' until the first IM message) is
+            // preserved in the diff. Removing scenario-bound MCPs (e.g. generative-ui)
+            // mid-session would leave the SDK's frozen systemPrompt referencing tools
+            // that no longer exist. This pass is purely additive for the IM-context
+            // tools the AI is about to need; scenario alignment is a separate concern.
+            //
+            // Builtin runtime only — external runtimes (CC/Codex) manage their own MCP set.
+            if (!shouldUseExternalRuntime()) {
+              await ensureSdkMcpInSync();
+            }
           }
 
-          // Set IM interaction scenario
+          // Set IM interaction scenario (after MCP sync, see note above)
           {
             const [imPlatform, imSourceType] = payload.source.split('_') as ['telegram' | 'feishu', 'private' | 'group'];
             setInteractionScenario({
@@ -8287,17 +8281,34 @@ async function main() {
               catch { /* stream closed */ }
             }, 15000);
 
-            unsubscribe = imEventBus.subscribe(safeSince, (event) => {
-              if (closed) return;
-              try {
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-              } catch {
-                // Controller closed mid-emit — schedule cleanup
+            unsubscribe = imEventBus.subscribe(
+              safeSince,
+              (event) => {
+                if (closed) return;
+                try {
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+                } catch {
+                  // Controller closed mid-emit — schedule cleanup
+                  closed = true;
+                  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+                  if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+                }
+              },
+              () => {
+                // imEventBus.clear() force-cleared the subscription (session
+                // reset). Close the SSE stream so the Rust event_consumer
+                // sees end-of-stream and reconnects with `since=<lastSeq>` —
+                // subscribe() will then synthesize the cross-generation gap
+                // event so events from the new session aren't silently lost.
+                if (closed) return;
                 closed = true;
                 if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
-                if (unsubscribe) { unsubscribe(); unsubscribe = null; }
-              }
-            });
+                try { controller.close(); } catch { /* already closed */ }
+                // No need to call unsubscribe() — clear() already removed us
+                // from both the subscribers Set and the clearedCallbacks Map.
+                unsubscribe = null;
+              },
+            );
           },
           cancel() {
             closed = true;
@@ -8666,11 +8677,36 @@ description: >
       // POST /api/im/session/new — Start a new session (preserving workspace)
       if (pathname === '/api/im/session/new' && request.method === 'POST') {
         try {
-          // Stop external runtime subprocess if active
-          if (shouldUseExternalRuntime() && isExternalSessionActive()) {
-            await stopExternalSession();
+          // Stop external runtime subprocess if active. First await any
+          // in-flight start/pre-warm so isExternalSessionActive() is truthful
+          // — otherwise a half-spawned subprocess (startingPromise pending,
+          // activeProcess still null) slips past the check, and once it
+          // finishes spawning it overwrites the freshly-rebound module
+          // state with its own (now-stale) assignments. Same race the
+          // /sessions/switch handler guards against.
+          if (shouldUseExternalRuntime()) {
+            await awaitExternalSessionStarting();
+            if (isExternalSessionActive()) {
+              await stopExternalSession();
+            }
           }
           await resetSession();
+          // External runtime: stopExternalSession only nulls activeProcess —
+          // module-level lastSessionId / lastRuntimeSessionId / allSessionMessages
+          // still point at the OLD conversation. Without an explicit re-bind,
+          // the next /api/im/enqueue hits the resume branch in sendExternalMessage,
+          // writes the new turn back into the old session_id, and leaves the
+          // freshly minted sessionId orphaned (no metadata, no IM tag, AI reply
+          // appears in the old chat instead of the new one). restoreExternalSessionState
+          // calls resetModuleState internally on sessionId-change, then sets
+          // lastSessionId to the fresh id — Case 1 (fresh start) on the next message.
+          // Scenario is set provisionally; the next /api/im/enqueue overwrites it.
+          if (shouldUseExternalRuntime()) {
+            const newSessionId = getSessionId();
+            if (newSessionId) {
+              restoreExternalSessionState(newSessionId, agentDir, { type: 'desktop' });
+            }
+          }
           return jsonResponse({
             sessionId: getSessionId(),
           });

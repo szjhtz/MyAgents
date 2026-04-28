@@ -15,6 +15,7 @@
   "core",
   "feishu",
   "infra-runtime",
+  "outbound-media",
   "param-readers",
   "plugin-entry",
   "reply-history",
