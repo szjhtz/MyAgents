@@ -8280,17 +8280,34 @@ async function main() {
               catch { /* stream closed */ }
             }, 15000);
 
-            unsubscribe = imEventBus.subscribe(safeSince, (event) => {
-              if (closed) return;
-              try {
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-              } catch {
-                // Controller closed mid-emit — schedule cleanup
+            unsubscribe = imEventBus.subscribe(
+              safeSince,
+              (event) => {
+                if (closed) return;
+                try {
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+                } catch {
+                  // Controller closed mid-emit — schedule cleanup
+                  closed = true;
+                  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+                  if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+                }
+              },
+              () => {
+                // imEventBus.clear() force-cleared the subscription (session
+                // reset). Close the SSE stream so the Rust event_consumer
+                // sees end-of-stream and reconnects with `since=<lastSeq>` —
+                // subscribe() will then synthesize the cross-generation gap
+                // event so events from the new session aren't silently lost.
+                if (closed) return;
                 closed = true;
                 if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
-                if (unsubscribe) { unsubscribe(); unsubscribe = null; }
-              }
-            });
+                try { controller.close(); } catch { /* already closed */ }
+                // No need to call unsubscribe() — clear() already removed us
+                // from both the subscribers Set and the clearedCallbacks Map.
+                unsubscribe = null;
+              },
+            );
           },
           cancel() {
             closed = true;
@@ -8659,11 +8676,36 @@ description: >
       // POST /api/im/session/new — Start a new session (preserving workspace)
       if (pathname === '/api/im/session/new' && request.method === 'POST') {
         try {
-          // Stop external runtime subprocess if active
-          if (shouldUseExternalRuntime() && isExternalSessionActive()) {
-            await stopExternalSession();
+          // Stop external runtime subprocess if active. First await any
+          // in-flight start/pre-warm so isExternalSessionActive() is truthful
+          // — otherwise a half-spawned subprocess (startingPromise pending,
+          // activeProcess still null) slips past the check, and once it
+          // finishes spawning it overwrites the freshly-rebound module
+          // state with its own (now-stale) assignments. Same race the
+          // /sessions/switch handler guards against.
+          if (shouldUseExternalRuntime()) {
+            await awaitExternalSessionStarting();
+            if (isExternalSessionActive()) {
+              await stopExternalSession();
+            }
           }
           await resetSession();
+          // External runtime: stopExternalSession only nulls activeProcess —
+          // module-level lastSessionId / lastRuntimeSessionId / allSessionMessages
+          // still point at the OLD conversation. Without an explicit re-bind,
+          // the next /api/im/enqueue hits the resume branch in sendExternalMessage,
+          // writes the new turn back into the old session_id, and leaves the
+          // freshly minted sessionId orphaned (no metadata, no IM tag, AI reply
+          // appears in the old chat instead of the new one). restoreExternalSessionState
+          // calls resetModuleState internally on sessionId-change, then sets
+          // lastSessionId to the fresh id — Case 1 (fresh start) on the next message.
+          // Scenario is set provisionally; the next /api/im/enqueue overwrites it.
+          if (shouldUseExternalRuntime()) {
+            const newSessionId = getSessionId();
+            if (newSessionId) {
+              restoreExternalSessionState(newSessionId, agentDir, { type: 'desktop' });
+            }
+          }
           return jsonResponse({
             sessionId: getSessionId(),
           });
