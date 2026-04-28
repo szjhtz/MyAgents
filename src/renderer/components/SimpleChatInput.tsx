@@ -16,7 +16,7 @@ import { isImageFile, isImageMimeType, ALLOWED_IMAGE_MIME_TYPES } from '../../sh
 import type { QueuedMessageInfo } from '@/types/queue';
 import { CUSTOM_EVENTS } from '../../shared/constants';
 import { isDebugMode } from '@/utils/debug';
-import { sanitizeMacFunctionKeysFromEvent } from '@/utils/macFunctionKeyFilter';
+import { renameIfBareClipboardImage } from '@/utils/clipboardImage';
 import { isProviderAvailable } from '@/config/configService';
 import { modelSupportsModality } from '@/config/services/providerService';
 import RuntimeSelector from '@/components/RuntimeSelector';
@@ -590,28 +590,34 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
       }
     }
 
-    // Modality warning at the input boundary. Sidecar still strips images on
-    // send (authoritative) — this is purely UX so the user knows the moment
-    // they paste/drop. We still queue the images into the UI: the user can
-    // see them in the message bubble post-send, can switch to a multimodal
-    // model and re-send, etc. One toast per batch (paste of 5 images = 1
-    // toast, not 5).
+    // Modality fallback at the input boundary (PRD prd_0.2.3_image_modality_file_fallback.md).
+    // When the model lacks image support, we re-route the image files into
+    // the regular non-image upload path: write to <agentDir>/myagents_files/
+    // and insert `@<path>` references into the input. The sidecar's
+    // `enqueueUserMessage` does the same thing as a backstop (covers IM Bot
+    // and any race where the model is changed between paste and send), but
+    // doing it here too makes the UX honest — what the user sees in the
+    // input is exactly what gets sent.
     //
-    // Skip the toast for external runtimes (Claude Code CLI / Codex / Gemini
-    // CLI). The Sidecar modality gate lives only in the builtin
-    // `enqueueUserMessage` path; external runtimes go through
-    // `external-session.ts` which has no filter. Showing "will be filtered"
-    // there is a false promise (no filter actually runs) AND a false warning
-    // for runtimes whose models DO accept images (Gemini 2.5 / 3 are
-    // multimodal). Coverage of external runtimes is deliberate V1 scope-skip.
-    if (
+    // External runtimes (Claude Code CLI / Codex / Gemini CLI) are exempt:
+    // they have no `inputModalities` metadata and treat all models as
+    // multimodal-capable. Forcing fallback there would be a false negative
+    // for runtimes whose models DO accept images (Gemini 2.5 / 3).
+    const fallbackImagesToFiles =
       imageFiles.length > 0 &&
       !isExternalRuntime &&
-      !modelSupportsModality(provider, currentModelId, 'image')
-    ) {
-      toastRef.current.warning(
-        `${getCurrentModelLabel(provider, currentModelId)} 不支持图片输入，发送时会自动过滤，仅文本送达`,
+      !modelSupportsModality(provider, currentModelId, 'image');
+
+    if (fallbackImagesToFiles) {
+      toastRef.current.info(
+        '当前模型不支持图片输入，已转为文件存入工作区供模型读取',
       );
+      // Bare clipboard names ("image.png" / "") get a timestamped name so
+      // pasted screenshots don't collide on disk into image_1.png, image_2.png.
+      for (const img of imageFiles) {
+        otherFiles.push(renameIfBareClipboardImage(img));
+      }
+      imageFiles.length = 0;
     }
 
     // Handle image files with the original addImage logic (no API needed)
@@ -714,17 +720,22 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
       }
     }
 
-    // Modality warning at input boundary (mirrors processDroppedFiles).
-    // Sidecar still strips on send; this is purely UX. External runtimes are
-    // skipped — see processDroppedFiles for the rationale.
-    if (
+    // Modality fallback at input boundary (mirrors processDroppedFiles —
+    // see the comment there for the full rationale and PRD reference). For
+    // Tauri-style absolute path drops we re-route the image paths into
+    // /api/files/copy alongside the non-image paths; original filenames are
+    // already real, so no rename is needed.
+    const fallbackImagesToFiles =
       imagePaths.length > 0 &&
       !isExternalRuntime &&
-      !modelSupportsModality(provider, currentModelId, 'image')
-    ) {
-      toastRef.current.warning(
-        `${getCurrentModelLabel(provider, currentModelId)} 不支持图片输入，发送时会自动过滤，仅文本送达`,
+      !modelSupportsModality(provider, currentModelId, 'image');
+
+    if (fallbackImagesToFiles) {
+      toastRef.current.info(
+        '当前模型不支持图片输入，已转为文件存入工作区供模型读取',
       );
+      otherPaths.push(...imagePaths);
+      imagePaths.length = 0;
     }
 
     // Handle image files - read via backend API and add as image attachments
@@ -986,13 +997,7 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
 
   // Handle text input change (detect @ and / and backspace)
   const handleInputChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    // Strip macOS function-key private-use codepoints (-) that
-    // WebKit leaks into the value when an arrow key is pressed at the
-    // textarea boundary. See utils/macFunctionKeyFilter.ts.
-    // Force-sync — a bare strip + setState is dropped by React 19's
-    // identical-value bailout, leaving the leak accumulating in the DOM
-    // forever. See utils/macFunctionKeyFilter.ts.
-    const newValue = sanitizeMacFunctionKeysFromEvent(e);
+    const newValue = e.target.value;
     const cursorPos = e.target.selectionStart;
 
     // Track current state locally to avoid stale closure issues
