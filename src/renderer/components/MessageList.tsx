@@ -299,8 +299,17 @@ const MessageList = memo(function MessageList({
   const renderItem = useMemo(() => (index: number, message: MessageType) => {
     const sm = streamingMessageRef.current;
     const isStreamingMsg = !!sm && message === sm;
+    // `flow-root` (not `overflow-hidden`) establishes a BFC so child Markdown
+    // margins don't leak past the wrapper — that's what e6de7173 originally
+    // wanted. `overflow-hidden` did the same job but added a hard clip side
+    // effect: when Virtuoso's height estimate (`defaultItemHeight=480`) was
+    // far from actual short-item height (~80px), the post-mount measurement
+    // correction shifted scroll anchors enough that short user bubbles got
+    // visually clipped instead of merely positioned slightly off — they
+    // disappeared while neighbouring items merged. flow-root keeps the
+    // measurement fix without the clipping.
     return (
-      <div className="mx-auto max-w-3xl px-3 py-1 overflow-hidden" data-chat-search-scope="">
+      <div className="mx-auto max-w-3xl px-3 py-1 flow-root" data-chat-search-scope="">
         <Message
           message={message}
           isLoading={isStreamingMsg && isLoadingRef.current}
@@ -365,8 +374,14 @@ const MessageList = memo(function MessageList({
 
         defaultItemHeight=480 is an empirical average across tool-use / text /
         thinking blocks; too low (200) causes Virtuoso to over-render initially,
-        too high leaves holes at the bottom. 480 keeps the initial estimate close
-        to reality without penalising short messages.
+        too high leaves holes at the bottom. 480 stays close to long-content
+        reality but does produce sizeable post-mount corrections on short user
+        bubbles (~80–150px). The previous wrapper used `overflow-hidden`, which
+        amplified those corrections into hard clips — short bubbles vanished
+        while neighbours merged. The wrapper is now `flow-root` (above), so any
+        residual correction shows up as a small scroll bounce rather than a
+        disappearing message. If the bounce becomes noticeable, lowering this
+        estimate is the next lever to pull.
       */}
       <Virtuoso
         ref={virtuosoRef}
