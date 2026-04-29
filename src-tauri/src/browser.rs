@@ -16,6 +16,18 @@ use tauri::{
 use std::path::Path;
 use crate::ulog_info;
 
+/// User-Agent for the embedded browser webview.
+///
+/// WKWebView's default UA on macOS omits the `Version/X Safari/Y` suffix
+/// that real Safari emits, which several big sites — baidu.com main page is
+/// the canonical example — fingerprint as a non-browser client and respond
+/// to with degraded/empty pages or redirect chains. Setting an explicit
+/// real-Safari UA makes those sites treat us as a normal Safari install.
+///
+/// Bot-detection arms race notwithstanding, this single line is the difference
+/// between baidu.com loading normally and a 30-redirects-per-second loop.
+const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15";
+
 /// Parse a URL string that may be an absolute file path or an http(s) URL.
 /// Handles both Unix (`/Users/...`) and Windows (`C:\Users\...`) paths.
 fn parse_url_or_path(url: &str) -> Result<Url, String> {
@@ -95,6 +107,7 @@ pub async fn cmd_browser_create(
     let label_new_win = label.clone();
 
     let builder = WebviewBuilder::new(&label, tauri::WebviewUrl::External(parsed_url.clone()))
+        .user_agent(BROWSER_USER_AGENT)
         .on_navigation(move |nav_url| {
             let scheme = nav_url.scheme();
             // Security: block dangerous schemes; allow everything else.
