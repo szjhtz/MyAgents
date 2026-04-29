@@ -316,7 +316,7 @@ export function ThoughtPanel({
   }, [bulkBusy, selectedIds, toast]);
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="relative flex h-full flex-col">
       {/* Section header — label on the left, persistent search pill on
           the right. The search pill replaces the prior "icon toggle →
           full-width input" pattern with an always-visible affordance
@@ -504,36 +504,6 @@ export function ThoughtPanel({
             the row height stable as we add buttons here later. */}
         <div />
       </div>
-
-      {/* Bulk-select dynamic header — when `selectMode` is on, replace the
-          standard count/filter bar with a "已进入多选模式" affordance and a
-          quick "全选当前列表" / "取消选择" pair. We keep the row in the same
-          place so the layout doesn't shift when the user opts in. The
-          floating ThoughtBulkBar at the bottom of the screen carries the
-          actual confirm/cancel actions. */}
-      {selectMode && (
-        <div className="flex min-h-[34px] items-center justify-between border-t border-[var(--line-subtle)] bg-[var(--accent-warm-subtle)]/40 px-4 py-1.5 text-[11px] text-[var(--ink-secondary)]">
-          <span className="font-semibold uppercase tracking-[0.12em] text-[var(--accent-warm)]">
-            多选模式
-          </span>
-          <div className="flex items-center gap-3">
-            <button
-              type="button"
-              onClick={() => setSelectedIds(new Set(filtered.map((t) => t.id)))}
-              className="text-[var(--ink-secondary)] hover:text-[var(--accent-warm)]"
-            >
-              全选当前列表
-            </button>
-            <button
-              type="button"
-              onClick={() => setSelectedIds(new Set())}
-              className="text-[var(--ink-muted)] hover:text-[var(--ink)]"
-            >
-              清除
-            </button>
-          </div>
-        </div>
-      )}
 
       {/* List */}
       <div className="flex-1 overflow-y-auto px-4 py-3">

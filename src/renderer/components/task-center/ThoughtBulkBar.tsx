@@ -1,5 +1,12 @@
-// ThoughtBulkBar — bottom-centered floating action bar for multi-select
+// ThoughtBulkBar — bottom-of-panel floating action bar for multi-select
 // mode in the Task Center 想法 panel. Shows when `selectMode` is true.
+//
+// Positioned `absolute` (NOT `fixed`) so it docks to the bottom of the
+// thought panel rather than the viewport. Its parent (ThoughtPanel root)
+// is `relative` for that anchoring. This keeps the bar over the thought
+// list only — without overlapping the right-hand task list — and follows
+// the panel when it scrolls into view, instead of always sitting at the
+// screen center where it would crowd unrelated UI.
 //
 // Sits at z-40 so it floats above the card list but below full-screen
 // overlays (e.g. DispatchTaskDialog at z-[200]) and the global toast/modal
@@ -27,7 +34,7 @@ export function ThoughtBulkBar({ count, onMerge, onDelete, onCancel, busy }: Pro
   const canMerge = count >= 2 && !busy;
   const canDelete = count >= 1 && !busy;
   return (
-    <div className="pointer-events-none fixed inset-x-0 bottom-6 z-40 flex justify-center">
+    <div className="pointer-events-none absolute inset-x-0 bottom-6 z-40 flex justify-center">
       <div
         className="pointer-events-auto flex items-center gap-1 rounded-full border border-[var(--line)] bg-[var(--paper-elevated)] px-2 py-1.5 shadow-lg"
         role="toolbar"
