@@ -15,6 +15,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { ChevronLeft, ChevronRight, Code2, RotateCw, ExternalLink, Loader2, Globe, X } from 'lucide-react';
 import { openExternal } from '@/utils/openExternal';
+import { BROWSER_BLANK_URL } from '@/components/browserConstants';
 import { useBrowserOverlayGuard } from '@/hooks/useBrowserOverlayGuard';
 import { useToast } from '@/components/Toast';
 import Tip from '@/components/Tip';
@@ -82,8 +83,8 @@ export default function BrowserPanel({
   useEffect(() => () => { isMountedRef.current = false; }, []);
 
   // Whether this webview has ever navigated to a real (non-blank) URL. Once
-  // true, subsequent visits to about:blank (e.g. via browser back-button) are
-  // shown by the native webview rather than overridden by our React empty
+  // true, subsequent visits to the blank page (e.g. via browser back-button)
+  // are shown by the native webview rather than overridden by our React empty
   // state — letting the user see the actual history page instead of the
   // "new tab" UI on every back-press.
   const [hasNavigated, setHasNavigated] = useState(false);
@@ -166,7 +167,7 @@ export default function BrowserPanel({
         // Latch hasNavigated on first real (non-blank) URL — lets the React
         // empty state release control over the panel for the rest of this
         // webview's lifetime.
-        if (next && next !== 'about:blank') {
+        if (next && next !== BROWSER_BLANK_URL) {
           setHasNavigated((prev) => (prev ? prev : true));
         }
         onUrlChangeRef.current?.(next);
@@ -215,17 +216,17 @@ export default function BrowserPanel({
   //
   // Anchored to the `url` prop (the URL the parent asked us to load) and a
   // one-way `hasNavigated` latch — NOT to the moving `currentUrl`. This means:
-  //   - Toolbar-opened browser (parent passes 'about:blank') → blank state
+  //   - Toolbar-opened browser (parent passes BROWSER_BLANK_URL) → blank state
   //     until the user types a URL and navigates away.
   //   - User opens a chat link (parent passes 'https://…') → never blank.
-  //   - User navigates from blank → site → presses Back to about:blank →
+  //   - User navigates from blank → site → presses Back to the blank page →
   //     hasNavigated stays true, so the native webview keeps control instead
   //     of our React empty state hijacking the back button.
   //
   // Avoiding `currentUrl` here also sidesteps the race where create resolves
   // a frame before the first `browser:url-changed` event arrives (an empty
   // `currentUrl` would otherwise hide the just-alive webview).
-  const isBlankPage = url === 'about:blank' && !hasNavigated;
+  const isBlankPage = url === BROWSER_BLANK_URL && !hasNavigated;
 
   // ── Consolidated show/hide ──
   useEffect(() => {
@@ -312,7 +313,7 @@ export default function BrowserPanel({
     }
   }, [handleUrlSubmit]);
 
-  // Extract display hostname (suppressed for blank state so we don't show "about:blank" text)
+  // Extract display hostname (suppressed for blank state so we don't show the raw sentinel URL)
   const displayUrl = currentUrl && !isBlankPage
     ? (() => { try { return new URL(currentUrl).hostname || currentUrl; } catch { return currentUrl; } })()
     : '';
@@ -420,7 +421,7 @@ export default function BrowserPanel({
           </div>
         )}
 
-        {/* Blank state — shown when about:blank or alive-but-no-url. Click anywhere to focus URL bar. */}
+        {/* Blank state — shown for the blank-page sentinel or alive-but-no-url. Click anywhere to focus URL bar. */}
         {isBlankPage && (
           <button
             type="button"

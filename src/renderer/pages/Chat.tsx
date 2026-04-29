@@ -47,6 +47,7 @@ import {
 import { patchAgentConfig, getAgentById } from '@/config/services/agentConfigService';
 import type { AgentConfig } from '../../shared/types/agent';
 import { BrowserPanelContext } from '@/context/BrowserPanelContext';
+import { BROWSER_BLANK_URL } from '@/components/browserConstants';
 import { CUSTOM_EVENTS, isPendingSessionId } from '../../shared/constants';
 import type { CapabilityInitialSelect } from '../../shared/skillsTypes';
 import { CC_MODELS, CC_PERMISSION_MODES, CODEX_PERMISSION_MODES, GEMINI_PERMISSION_MODES, getDefaultRuntimePermissionMode, getRuntimePermissionModes } from '../../shared/types/runtime';
@@ -405,9 +406,11 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
   }, []);
 
   // Open empty browser from toolbar button.
-  // First click → create about:blank webview. Subsequent clicks just switch view (URL preserved).
+  // First click → create blank webview (BROWSER_BLANK_URL is a data: URL, not
+  // about:blank — see browserConstants.ts for why). Subsequent clicks just
+  // switch view (URL preserved).
   const handleOpenBrowser = useCallback(() => {
-    setBrowserUrl((prev) => prev ?? 'about:blank');
+    setBrowserUrl((prev) => prev ?? BROWSER_BLANK_URL);
     setSplitActiveView('browser');
   }, []);
 
@@ -2983,7 +2986,7 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
                         : (() => {
                             // Prefer the live URL surfaced from BrowserPanel — the
                             // `browserUrl` prop is the seed only and stays at
-                            // 'about:blank' even after the user navigates.
+                            // BROWSER_BLANK_URL even after the user navigates.
                             const liveUrl = browserCurrentUrl || browserUrl;
                             try {
                               return new URL(liveUrl).hostname || '新标签页';

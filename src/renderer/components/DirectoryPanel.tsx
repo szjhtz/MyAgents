@@ -166,7 +166,7 @@ interface DirectoryPanelProps {
   onOpenTerminal?: () => void;
   /** Whether an embedded terminal is currently alive (for indicator display) */
   terminalAlive?: boolean;
-  /** Open embedded browser in split panel (creates about:blank if not yet open) */
+  /** Open embedded browser in split panel (creates a blank page if not yet open) */
   onOpenBrowser?: () => void;
 }
 
