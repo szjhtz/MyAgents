@@ -127,14 +127,14 @@ pub async fn cmd_browser_create(
                 PageLoadEvent::Finished => {
                     ulog_info!("[browser] on_page_load FINISHED: {}", url_str);
                     let _ = app_load.emit(&event_name, false);
-                    // Emit final URL (may differ from navigation URL due to redirects)
-                    if let Ok(final_url) = _webview.url() {
-                        ulog_info!("[browser] Final URL after load: {}", final_url);
-                        let _ = app_load.emit(
-                            &format!("browser:url-changed:{}", tab_id_load),
-                            final_url.to_string(),
-                        );
-                    }
+                    // Use the load-event's payload URL — calling _webview.url()
+                    // here panics inside wry's url_from_webview when WKWebView.URL
+                    // is nil (notably for about:blank in transient states), which
+                    // tao's stop_app_on_panic then escalates to a process crash.
+                    let _ = app_load.emit(
+                        &format!("browser:url-changed:{}", tab_id_load),
+                        url_str.clone(),
+                    );
                 }
             }
         })
@@ -170,15 +170,12 @@ pub async fn cmd_browser_create(
 
     ulog_info!("[browser] add_child SUCCESS for label='{}'", label);
 
-    // Verify webview is accessible
-    if let Some(wv) = app.get_webview(&label) {
-        match wv.url() {
-            Ok(u) => ulog_info!("[browser] Webview current url: {}", u),
-            Err(e) => ulog_info!("[browser] Webview url() error: {}", e),
-        }
-    } else {
-        ulog_info!("[browser] WARNING: webview '{}' not found after add_child!", label);
-    }
+    // NOTE: do NOT call `app.get_webview(&label).url()` here as a "health check".
+    // wry's url_from_webview unwraps WKWebView.URL which may be nil for a
+    // freshly-created webview (especially about:blank), and that unwrap panic
+    // crashes the whole event loop via tao's stop_app_on_panic. See
+    // wry-0.54.4/src/wkwebview/mod.rs:1349. add_child returning Ok is itself
+    // sufficient evidence that the webview was created.
 
     // Store session
     let mut sessions = state.sessions.lock().await;
