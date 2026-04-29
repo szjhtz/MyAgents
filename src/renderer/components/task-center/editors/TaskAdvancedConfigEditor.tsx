@@ -70,25 +70,6 @@ export function TaskAdvancedConfigEditor(props: Props) {
     setMcpEnabledServers,
   } = props;
 
-  // Wrap `setRuntime` so switching to a non-builtin runtime *also* clears
-  // model + MCP overrides — those fields are SDK-builtin-only (the UI hides
-  // them for external runtimes). Without the cleanup, a user who picks
-  // builtin → enters `claude-sonnet-4-6` → switches to codex would persist
-  // a stale model that the codex runtime can't resolve, leading to silent
-  // execution failure. This is a structural guarantee (cleanup happens at
-  // the only entry point that changes runtime) rather than a convention.
-  const setRuntime = useCallback(
-    (next: RuntimeType | undefined) => {
-      const isBuiltinNext = (next ?? 'builtin') === 'builtin';
-      setRuntimeRaw(next);
-      if (!isBuiltinNext) {
-        if (model !== undefined) setModel(undefined);
-        if (mcpEnabledServers !== undefined) setMcpEnabledServers(undefined);
-      }
-    },
-    [setRuntimeRaw, setModel, setMcpEnabledServers, model, mcpEnabledServers],
-  );
-
   // Default-collapsed; expand state is local to the panel lifecycle.
   // Auto-expand if any value is already set (so "edit existing override"
   // doesn't hide what the user previously configured).
@@ -101,32 +82,78 @@ export function TaskAdvancedConfigEditor(props: Props) {
 
   const { config, projects, providers } = useConfig();
 
+  // Resolve the workspace's Agent — source of truth for the runtime / model
+  // / permission / MCP defaults that the task inherits when the user picks
+  // "跟随 Agent". Mirrors WorkspaceBasicsSection: when the Agent uses an
+  // external runtime (Claude Code CLI / Codex / Gemini), the entire below
+  // panel is hidden because external runtimes manage their own model /
+  // permission / MCP via their own CLI flags.
+  const workspaceAgent = useMemo(() => {
+    if (!workspacePath) return null;
+    return config?.agents?.find((a) => a.workspacePath === workspacePath) ?? null;
+  }, [workspacePath, config]);
+
+  // Effective runtime that this task will run under:
+  //   user override `runtime` (if set) > Agent's runtime > 'builtin' default
+  // External runtimes self-manage model/permission/MCP, so all three
+  // sub-fields are gated on `effectiveRuntime === 'builtin'`.
+  const agentRuntime: RuntimeType = workspaceAgent?.runtime ?? 'builtin';
+  const effectiveRuntime: RuntimeType = runtime ?? agentRuntime;
+  const isBuiltin = effectiveRuntime === 'builtin';
+  const agentRuntimeLabel = RUNTIME_DISPLAY_NAMES[agentRuntime] ?? agentRuntime;
+  const effectiveRuntimeLabel = RUNTIME_DISPLAY_NAMES[effectiveRuntime] ?? effectiveRuntime;
+
+  // Wrap `setRuntime` so switching to a non-builtin EFFECTIVE runtime also
+  // clears model + MCP overrides — those fields apply only to the builtin
+  // SDK; external runtimes (Claude Code CLI / Codex / Gemini) self-manage.
+  // The check uses the new effective runtime (override OR Agent fallback)
+  // so toggling override = "follow Agent" while Agent is external also
+  // strips stale model/MCP rather than silently keeping them.
+  const setRuntime = useCallback(
+    (next: RuntimeType | undefined) => {
+      setRuntimeRaw(next);
+      const nextEffective: RuntimeType = next ?? agentRuntime;
+      if (nextEffective !== 'builtin') {
+        if (model !== undefined) setModel(undefined);
+        if (mcpEnabledServers !== undefined) setMcpEnabledServers(undefined);
+      }
+    },
+    [setRuntimeRaw, setModel, setMcpEnabledServers, model, mcpEnabledServers, agentRuntime],
+  );
+
+  // Workspace project — used to resolve provider/model fallback when the
+  // Agent's `model` is unset.
+  const workspaceProject = useMemo(() => {
+    if (!workspacePath) return null;
+    return projects.find((p) => p.path === workspacePath) ?? null;
+  }, [workspacePath, projects]);
+
   // Resolve the workspace's provider so we can populate the model picker
   // with the same model list the chat sidebar uses.
   //
   // Fallback chain (mirrors Launcher.tsx and App.tsx for legacy projects):
-  //   project.providerId → config.defaultProviderId → null
+  //   agent.providerId → project.providerId → config.defaultProviderId → null
   //
   // Legacy projects (created before per-project provider was introduced)
   // have providerId === null; those rely on the global default and we
   // surface its model list so the picker still works for them.
   const workspaceProvider = useMemo(() => {
-    if (!workspacePath) return null;
-    const project = projects.find((p) => p.path === workspacePath);
-    const providerId = project?.providerId ?? config?.defaultProviderId ?? null;
+    const providerId =
+      workspaceAgent?.providerId
+      ?? workspaceProject?.providerId
+      ?? config?.defaultProviderId
+      ?? null;
     if (!providerId) return null;
     return providers.find((p) => p.id === providerId) ?? null;
-  }, [workspacePath, projects, providers, config]);
+  }, [workspaceAgent, workspaceProject, providers, config]);
 
   // Display label for "跟随 Agent" — what model does the workspace
-  // currently use? Reuses the same precedence the chat-side picker uses:
-  // project.model (per-workspace override) > provider.primaryModel (default).
-  const workspaceProject = useMemo(() => {
-    if (!workspacePath) return null;
-    return projects.find((p) => p.path === workspacePath) ?? null;
-  }, [workspacePath, projects]);
+  // currently use? Precedence: agent.model > project.model > provider.primaryModel.
   const workspaceDefaultModel =
-    workspaceProject?.model || workspaceProvider?.primaryModel || '';
+    workspaceAgent?.model
+    || workspaceProject?.model
+    || workspaceProvider?.primaryModel
+    || '';
 
   const modelOptions = useMemo(() => {
     if (!workspaceProvider) return [{ value: FOLLOW_VALUE, label: '跟随 Agent 工作区' }];
@@ -173,11 +200,11 @@ export function TaskAdvancedConfigEditor(props: Props) {
     [],
   );
 
-  // Permission-mode options pivot on the active runtime. When the user
-  // hasn't picked one (still inheriting from Agent), default the option
-  // list to the SDK builtin set — that's what 90% of agents run.
+  // Permission-mode options pivot on the EFFECTIVE runtime (Agent's runtime
+  // when no override, override otherwise). When the picker is shown the
+  // effective runtime is always 'builtin' (the entire below panel is hidden
+  // for external runtimes), but we still derive defensively.
   const permissionOptions = useMemo(() => {
-    const effectiveRuntime: RuntimeType = (runtime ?? 'builtin') as RuntimeType;
     const modes = getRuntimePermissionModes(effectiveRuntime);
     if (effectiveRuntime === 'builtin') {
       // Builtin uses the trio from `PERMISSION_MODES` (auto/plan/fullAgency)
@@ -197,9 +224,7 @@ export function TaskAdvancedConfigEditor(props: Props) {
         label: m.description ? `${m.label} · ${m.description}` : m.label,
       })),
     ];
-  }, [runtime]);
-
-  const isBuiltin = (runtime ?? 'builtin') === 'builtin';
+  }, [effectiveRuntime]);
 
   // Toggle a single MCP server in the override list (PRD 0.2.4 §需求 4).
   //
@@ -248,13 +273,16 @@ export function TaskAdvancedConfigEditor(props: Props) {
 
       {open && (
         <div className="space-y-5 border-t border-[var(--line-subtle)] px-4 py-4">
-          {/* Runtime */}
+          {/* Runtime — always visible. The hint copy surfaces the Agent's
+              actual current runtime name (e.g. "Gemini CLI") so the user
+              can see at a glance what "跟随 Agent" resolves to without
+              cross-referencing the Agent settings panel. */}
           <FieldRow
             label="Runtime"
             hint={
               workspaceLabel
-                ? `不选择时跟随 ${workspaceLabel} 当前 runtime`
-                : '不选择时跟随 Agent 工作区当前 runtime'
+                ? `不选择时跟随 ${workspaceLabel}（当前 ${agentRuntimeLabel}）`
+                : `不选择时跟随 Agent 工作区（当前 ${agentRuntimeLabel}）`
             }
           >
             <CustomSelect
@@ -265,14 +293,26 @@ export function TaskAdvancedConfigEditor(props: Props) {
             />
           </FieldRow>
 
-          {/* Model — only meaningful when builtin runtime is in play.
+          {/* External runtime notice — when the effective runtime is not
+              builtin, the Model / Permission / MCP sub-fields are hidden
+              because external runtimes (Claude Code CLI / Codex / Gemini)
+              manage those concerns through their own CLI flags. Mirrors
+              the WorkspaceBasicsSection treatment of the same situation
+              so the two surfaces feel consistent. */}
+          {!isBuiltin && (
+            <p className="rounded-[var(--radius-md)] bg-[var(--accent-warm-subtle)] px-3.5 py-2.5 text-[12px] leading-relaxed text-[var(--ink-muted)]">
+              当前任务的运行环境为
+              <span className="mx-1 font-medium text-[var(--ink-secondary)]">{effectiveRuntimeLabel}</span>
+              ，模型 / 权限 / MCP 工具均由 {effectiveRuntimeLabel} 自身管理。如需调整请在该 CLI 的配置中修改，或将 Runtime 改为
+              <span className="mx-1 font-medium text-[var(--ink-secondary)]">{RUNTIME_DISPLAY_NAMES.builtin}</span>
+              以启用任务级覆盖。
+            </p>
+          )}
+
+          {/* Model — only meaningful when builtin runtime is effective.
               External runtimes resolve their own model from the runtime
-              process, so we hide this field rather than pretend it's
-              actionable. The picker pulls models from the workspace's
-              provider (set in workspace settings), so cross-provider
-              overrides aren't possible here — by design, since per-task
-              provider switching is a far more invasive change than v0.2.4
-              targets. */}
+              process; the picker pulls models from the workspace's
+              provider (cross-provider override is out of scope for v0.2.4). */}
           {isBuiltin && (
             <FieldRow
               label="模型"
@@ -293,18 +333,20 @@ export function TaskAdvancedConfigEditor(props: Props) {
             </FieldRow>
           )}
 
-          {/* Permission mode */}
-          <FieldRow
-            label="权限模式"
-            hint="不选择时使用所选 runtime 的最大权限（默认 bypassPermissions），适合无人值守任务"
-          >
-            <CustomSelect
-              value={permissionMode ?? FOLLOW_VALUE}
-              options={permissionOptions}
-              onChange={(v) => setPermissionMode(v ? v : undefined)}
-              placeholder="跟随默认（最大权限）"
-            />
-          </FieldRow>
+          {/* Permission mode — builtin only (external runtimes own this) */}
+          {isBuiltin && (
+            <FieldRow
+              label="权限模式"
+              hint="不选择时使用所选 runtime 的最大权限（默认 bypassPermissions），适合无人值守任务"
+            >
+              <CustomSelect
+                value={permissionMode ?? FOLLOW_VALUE}
+                options={permissionOptions}
+                onChange={(v) => setPermissionMode(v ? v : undefined)}
+                placeholder="跟随默认（最大权限）"
+              />
+            </FieldRow>
+          )}
 
           {/* MCP enable list */}
           {isBuiltin && (
