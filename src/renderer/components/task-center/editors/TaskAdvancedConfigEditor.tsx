@@ -14,7 +14,7 @@
 // (see `src/server/index.ts` `/cron/execute`); the field surfaced here is
 // the user-facing escape hatch when they want a stricter mode.
 
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { ChevronDown, Settings2 } from 'lucide-react';
 import CustomSelect from '@/components/CustomSelect';
 import { useConfig } from '@/hooks/useConfig';
@@ -34,8 +34,12 @@ import type { McpServerDefinition } from '@/config/types';
 const FOLLOW_VALUE = '';
 
 interface Props {
-  /** Workspace path the task is bound to — used as a hint in the placeholder
-   *  copy (e.g. "跟随 Agent 工作区当前模型"). Optional. */
+  /** Workspace path the task is bound to — used to resolve the workspace's
+   *  provider so the model picker can populate from the right model list,
+   *  and as a hint in placeholder copy (e.g. "跟随 Agent 工作区当前模型"). */
+  workspacePath?: string;
+  /** Optional display label for the workspace (used in hint copy when
+   *  `workspacePath` doesn't resolve to a known project). */
   workspaceLabel?: string;
 
   // ─── Runtime / model / permission mode ───────────────────────────────
@@ -54,9 +58,10 @@ interface Props {
 
 export function TaskAdvancedConfigEditor(props: Props) {
   const {
+    workspacePath,
     workspaceLabel,
     runtime,
-    setRuntime,
+    setRuntime: setRuntimeRaw,
     model,
     setModel,
     permissionMode,
@@ -64,6 +69,25 @@ export function TaskAdvancedConfigEditor(props: Props) {
     mcpEnabledServers,
     setMcpEnabledServers,
   } = props;
+
+  // Wrap `setRuntime` so switching to a non-builtin runtime *also* clears
+  // model + MCP overrides — those fields are SDK-builtin-only (the UI hides
+  // them for external runtimes). Without the cleanup, a user who picks
+  // builtin → enters `claude-sonnet-4-6` → switches to codex would persist
+  // a stale model that the codex runtime can't resolve, leading to silent
+  // execution failure. This is a structural guarantee (cleanup happens at
+  // the only entry point that changes runtime) rather than a convention.
+  const setRuntime = useCallback(
+    (next: RuntimeType | undefined) => {
+      const isBuiltinNext = (next ?? 'builtin') === 'builtin';
+      setRuntimeRaw(next);
+      if (!isBuiltinNext) {
+        if (model !== undefined) setModel(undefined);
+        if (mcpEnabledServers !== undefined) setMcpEnabledServers(undefined);
+      }
+    },
+    [setRuntimeRaw, setModel, setMcpEnabledServers, model, mcpEnabledServers],
+  );
 
   // Default-collapsed; expand state is local to the panel lifecycle.
   // Auto-expand if any value is already set (so "edit existing override"
@@ -75,7 +99,57 @@ export function TaskAdvancedConfigEditor(props: Props) {
     || mcpEnabledServers !== undefined;
   const [open, setOpen] = useState<boolean>(hasAnyOverride);
 
-  const { config } = useConfig();
+  const { config, projects, providers } = useConfig();
+
+  // Resolve the workspace's provider so we can populate the model picker
+  // with the same model list the chat sidebar uses.
+  //
+  // Fallback chain (mirrors Launcher.tsx and App.tsx for legacy projects):
+  //   project.providerId → config.defaultProviderId → null
+  //
+  // Legacy projects (created before per-project provider was introduced)
+  // have providerId === null; those rely on the global default and we
+  // surface its model list so the picker still works for them.
+  const workspaceProvider = useMemo(() => {
+    if (!workspacePath) return null;
+    const project = projects.find((p) => p.path === workspacePath);
+    const providerId = project?.providerId ?? config?.defaultProviderId ?? null;
+    if (!providerId) return null;
+    return providers.find((p) => p.id === providerId) ?? null;
+  }, [workspacePath, projects, providers, config]);
+
+  // Display label for "跟随 Agent" — what model does the workspace
+  // currently use? Reuses the same precedence the chat-side picker uses:
+  // project.model (per-workspace override) > provider.primaryModel (default).
+  const workspaceProject = useMemo(() => {
+    if (!workspacePath) return null;
+    return projects.find((p) => p.path === workspacePath) ?? null;
+  }, [workspacePath, projects]);
+  const workspaceDefaultModel =
+    workspaceProject?.model || workspaceProvider?.primaryModel || '';
+
+  const modelOptions = useMemo(() => {
+    if (!workspaceProvider) return [{ value: FOLLOW_VALUE, label: '跟随 Agent 工作区' }];
+    const opts = [
+      {
+        value: FOLLOW_VALUE,
+        label: workspaceDefaultModel
+          ? `跟随 Agent（当前 ${workspaceDefaultModel}）`
+          : '跟随 Agent 工作区',
+      },
+      ...workspaceProvider.models.map((m) => ({
+        value: m.model,
+        label: m.modelName ? `${m.modelName} · ${m.model}` : m.model,
+      })),
+    ];
+    // Surface a previously-set model that isn't in the catalogue (legacy /
+    // hand-typed) so the user can see and clear it without it silently
+    // appearing as "跟随 Agent" in the dropdown.
+    if (model && !workspaceProvider.models.some((m) => m.model === model)) {
+      opts.push({ value: model, label: `其他：${model}` });
+    }
+    return opts;
+  }, [workspaceProvider, workspaceDefaultModel, model]);
 
   // MCP catalogue — user's installed servers plus presets that are bundled.
   // Presets that are filtered by platform on the renderer side already get
@@ -127,12 +201,13 @@ export function TaskAdvancedConfigEditor(props: Props) {
 
   const isBuiltin = (runtime ?? 'builtin') === 'builtin';
 
-  // Toggle a single MCP server in the override list. First toggle on a
-  // pristine field promotes `undefined` → `[serverId]` (the user is opting
-  // in); first toggle that drops the last item collapses back to `undefined`
-  // (= follow Agent again). An "explicitly empty" override (`[]`) is also
-  // a valid state — the user selects every server then clicks 「显式关闭」
-  // to switch it (TODO: keep simple — just rely on the toggle path for now).
+  // Toggle a single MCP server in the override list (PRD 0.2.4 §需求 4).
+  //
+  // Two-state model — "follow Agent" (`undefined`) vs. "override with this
+  // explicit list" (`[a, b, ...]`). Dropping the last item collapses back
+  // to `undefined` so an emptied list never lingers as a meaningless
+  // "explicit empty" — Rust's `update` treats `Some(vec![])` as a clear
+  // anyway, so collapsing here keeps the wire/storage shapes 1:1.
   const toggleMcp = (id: string) => {
     if (mcpEnabledServers === undefined) {
       setMcpEnabledServers([id]);
@@ -140,14 +215,15 @@ export function TaskAdvancedConfigEditor(props: Props) {
     }
     if (mcpEnabledServers.includes(id)) {
       const next = mcpEnabledServers.filter((s) => s !== id);
-      setMcpEnabledServers(next);
+      // Last item dropped → revert to "follow Agent" rather than
+      // persisting `[]` (which the backend coerces to follow anyway).
+      setMcpEnabledServers(next.length === 0 ? undefined : next);
     } else {
       setMcpEnabledServers([...mcpEnabledServers, id]);
     }
   };
 
   const resetMcpToFollow = () => setMcpEnabledServers(undefined);
-  const clearMcp = () => setMcpEnabledServers([]);
 
   return (
     <div className="rounded-[var(--radius-md)] border border-[var(--line-subtle)] bg-[var(--paper-inset)]/50">
@@ -189,26 +265,31 @@ export function TaskAdvancedConfigEditor(props: Props) {
             />
           </FieldRow>
 
-          {/* Model — only meaningful when builtin runtime is in play (or
-              left to the Agent default which most users run as builtin).
+          {/* Model — only meaningful when builtin runtime is in play.
               External runtimes resolve their own model from the runtime
               process, so we hide this field rather than pretend it's
-              actionable. */}
+              actionable. The picker pulls models from the workspace's
+              provider (set in workspace settings), so cross-provider
+              overrides aren't possible here — by design, since per-task
+              provider switching is a far more invasive change than v0.2.4
+              targets. */}
           {isBuiltin && (
             <FieldRow
               label="模型"
-              hint="留空时跟随 Agent 工作区当前模型；填写则强制使用该模型"
+              hint="不选择时跟随 Agent 当前模型；选择后强制使用该模型"
             >
-              <input
-                type="text"
-                value={model ?? ''}
-                onChange={(e) => {
-                  const next = e.target.value.trim();
-                  setModel(next.length > 0 ? next : undefined);
-                }}
-                placeholder="例如: claude-sonnet-4-6 / claude-opus-4-7"
-                className="w-full rounded-[var(--radius-md)] border border-[var(--line)] bg-[var(--paper)] px-3 py-1.5 text-[13px] text-[var(--ink)] placeholder:text-[var(--ink-muted)]/60 focus:border-[var(--accent-warm)] focus:outline-none"
-              />
+              {workspaceProvider ? (
+                <CustomSelect
+                  value={model ?? FOLLOW_VALUE}
+                  options={modelOptions}
+                  onChange={(v) => setModel(v ? v : undefined)}
+                  placeholder="跟随 Agent 工作区"
+                />
+              ) : (
+                <div className="rounded-[var(--radius-md)] border border-dashed border-[var(--line)] px-3 py-2 text-[12px] text-[var(--ink-muted)]">
+                  工作区未配置 provider — 请先在工作区设置中选择一个 provider 才能在此覆盖模型
+                </div>
+              )}
             </FieldRow>
           )}
 
@@ -232,9 +313,7 @@ export function TaskAdvancedConfigEditor(props: Props) {
               hint={
                 mcpEnabledServers === undefined
                   ? '当前跟随 Agent 工作区的 MCP 启用列表'
-                  : mcpEnabledServers.length === 0
-                    ? '当前显式关闭所有 MCP 工具'
-                    : `当前启用 ${mcpEnabledServers.length} 个 MCP 工具`
+                  : `当前启用 ${mcpEnabledServers.length} 个 MCP 工具`
               }
             >
               {mcpCatalogue.length === 0 ? (
@@ -276,15 +355,6 @@ export function TaskAdvancedConfigEditor(props: Props) {
                       className="text-[var(--ink-muted)] hover:text-[var(--accent-warm)] disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       恢复跟随 Agent
-                    </button>
-                    <span className="text-[var(--ink-muted)]/40">•</span>
-                    <button
-                      type="button"
-                      onClick={clearMcp}
-                      disabled={mcpEnabledServers !== undefined && mcpEnabledServers.length === 0}
-                      className="text-[var(--ink-muted)] hover:text-[var(--error)] disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      显式关闭所有
                     </button>
                   </div>
                 </>

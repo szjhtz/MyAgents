@@ -234,6 +234,8 @@ import {
   switchToSession,
   setMcpServers,
   getMcpServers,
+  applyMcpOverrideAndAwaitReady,
+  withCronDispatchLock,
   setAgents,
   setSessionModel,
   resetSession,
@@ -269,7 +271,7 @@ import {
   updateSessionMetadata,
   getAttachmentPath,
 } from './SessionStore';
-import { findAgentByWorkspacePath } from './utils/admin-config';
+import { findAgentByWorkspacePath, getAllMcpServers, getEffectiveMcpServers } from './utils/admin-config';
 import { snapshotForOwnedSession } from './utils/session-snapshot';
 import { resolveSessionConfig } from './utils/resolve-session-config';
 import type { AgentConfig } from '../shared/types/agent';
@@ -409,6 +411,13 @@ type CronExecutePayload = {
     maxOutputTokensParamName?: 'max_tokens' | 'max_completion_tokens' | 'max_output_tokens';
     upstreamFormat?: 'chat_completions' | 'responses';
   };
+  /**
+   * Per-task MCP enable list override (PRD 0.2.4 §需求 4).
+   * `undefined` = follow workspace MCP (`config.agents[].mcpEnabledServers`).
+   * `[id, id, ...]` = enable only these MCP server ids for this task.
+   * Sidecar applies via `setMcpServers()` before `enqueueUserMessage`.
+   */
+  mcpEnabledServers?: string[];
   /** Run mode: "single_session" (keep context) or "new_session" (fresh each time) */
   runMode?: 'single_session' | 'new_session';
   /** Task execution interval in minutes (for System Prompt context) */
@@ -2201,6 +2210,14 @@ async function main() {
           return jsonResponse({ success: false, error: 'taskId and prompt are required.' }, 400);
         }
 
+        // Wrap the entire cron handler body in `withCronDispatchLock` so two
+        // concurrent ticks within a single sidecar can't interleave on
+        // shared global state — `currentMcpServers`, the active session,
+        // `cronTaskContext`, `interactionScenario`. Without this, request
+        // A's session switch / scenario could be silently overwritten by
+        // request B before A reaches `enqueueUserMessage`. PRD 0.2.4 §3.6
+        // (cross-review B7).
+        return await withCronDispatchLock(async () => {
         // Handle session setup based on runMode
         const effectiveRunMode = runMode ?? 'single_session';
         const { agentDir } = getAgentState();
@@ -2221,6 +2238,14 @@ async function main() {
           const cronSnapshot: Partial<SessionMetadata> = cronAgent ? snapshotForOwnedSession(cronAgent) : {};
           const overrideRuntime = payload.runtime ?? getActiveRuntimeType();
           if (overrideRuntime) cronSnapshot.runtime = overrideRuntime;
+          // PRD 0.2.4 §需求 4 — stamp per-task MCP override into the new
+          // session's metadata BEFORE creation, so the session is born with
+          // the right MCP set. The setMcpServers() call further down still
+          // runs for safety, but for new_session mode it's typically a
+          // no-op because the snapshot already matches the override.
+          if (payload.mcpEnabledServers !== undefined) {
+            cronSnapshot.mcpEnabledServers = payload.mcpEnabledServers;
+          }
           // Rust rotates a fresh UUID per tick for new_session mode (see
           // cron_task.rs::rotate_new_session_id) and passes it as
           // payload.sessionId. Honour that id here — if we generated our
@@ -2406,6 +2431,44 @@ async function main() {
             textContent = getLastExternalAssistantText();
           } else {
             // ─── Builtin Runtime: existing path ───
+
+            // PRD 0.2.4 §需求 4 — reconcile MCP set + run the turn under
+            // a single locked critical section so two concurrent cron
+            // ticks never interleave their abort/restart with each
+            // other's in-flight turn (cross-review B5).
+            //
+            // Target MCP set:
+            //   1. Task carries an override → apply that exact list.
+            //   2. Task has no override ("follow Agent") → reconcile to
+            //      the workspace's effective MCP. This is critical because
+            //      `currentMcpServers` is module-global state that the
+            //      previous task's override may have mutated. Without an
+            //      explicit reset, "follow Agent" silently inherits the
+            //      previous task's override (cross-review B1).
+            //
+            // The helper is fingerprint-gated, so when the desired set
+            // already matches `currentMcpServers` it's a cheap no-op.
+            let target: McpServerDefinition[];
+            if (payload.mcpEnabledServers !== undefined) {
+              const allServers = getAllMcpServers();
+              const overrideIds = new Set(payload.mcpEnabledServers);
+              target = allServers.filter((s) => overrideIds.has(s.id));
+              console.log(
+                `[cron] execute-sync taskId=${taskId} applying task MCP override: [${
+                  target.map((s) => s.id).join(',') || '(empty)'
+                }]`,
+              );
+            } else {
+              // No override → reconcile to workspace effective MCP so a
+              // previous task's override doesn't leak into this run.
+              target = getEffectiveMcpServers(agentDir);
+            }
+
+            // Apply MCP set first (this may abort + restart the session;
+            // the outer `withCronDispatchLock` keeps two concurrent ticks
+            // from interleaving across the abort/restart window).
+            await applyMcpOverrideAndAwaitReady(target);
+
             // Cron tasks are unattended — bypass all permissions so tool requests
             // (e.g. Bash) don't block forever waiting for human approval.
             // T15: effectiveModel / effectiveProviderEnv come from the session snapshot
@@ -2491,6 +2554,7 @@ async function main() {
           console.log(`[cron] execute-sync taskId=${taskId} returning error response:`, JSON.stringify(errorResponse));
           return jsonResponse(errorResponse, 500);
         }
+        }); // end withCronDispatchLock
       }
 
       // ============= GLOBAL STATS API =============

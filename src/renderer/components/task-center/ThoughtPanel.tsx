@@ -74,6 +74,22 @@ export function ThoughtPanel({
     try {
       const list = await thoughtList({});
       setThoughts(list);
+      // Drop any phantom ids from the current selection — a thought that
+      // was selected before reload but no longer exists (e.g. deleted in
+      // another window, or merged elsewhere) shouldn't keep counting
+      // toward the bulk-action header. handleCardChanged covers in-panel
+      // deletes; this catches external mutations.
+      setSelectedIds((prev) => {
+        if (prev.size === 0) return prev;
+        const valid = new Set(list.map((t) => t.id));
+        let changed = false;
+        const next = new Set<string>();
+        for (const id of prev) {
+          if (valid.has(id)) next.add(id);
+          else changed = true;
+        }
+        return changed ? next : prev;
+      });
     } catch (err) {
       console.error('[ThoughtPanel] load failed', err);
       setThoughts([]);
@@ -241,16 +257,27 @@ export function ThoughtPanel({
     }
     setBulkBusy(true);
     try {
-      const merged = await thoughtMerge(orderedIds);
-      // Update local state: drop sources, prepend merged thought.
+      const result = await thoughtMerge(orderedIds);
+      const { merged, failedSourceDeletes } = result;
+      // Drop only the sources that backend successfully removed; surface
+      // the rest so the panel still shows them and the user can retry.
+      const failedIds = new Set(failedSourceDeletes.map((f) => f.id));
+      const successfullyDeletedIds = orderedIds.filter((id) => !failedIds.has(id));
       setThoughts((prev) => {
-        const dropped = prev.filter((t) => !orderedIds.includes(t.id));
+        const dropped = prev.filter((t) => !successfullyDeletedIds.includes(t.id));
         return [merged, ...dropped];
       });
       setSelectedIds(new Set());
       setSelectMode(false);
-      toast.success(`已合并 ${orderedIds.length} 条想法`);
+      if (failedSourceDeletes.length === 0) {
+        toast.success(`已合并 ${orderedIds.length} 条想法`);
+      } else {
+        toast.error(
+          `合并完成，但 ${failedSourceDeletes.length} 条原始想法清理失败，请手动删除。`,
+        );
+      }
     } catch (e) {
+      // Pre-flight or atomic-create failure — no source touched, no merge.
       toast.error(`合并失败：${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setBulkBusy(false);

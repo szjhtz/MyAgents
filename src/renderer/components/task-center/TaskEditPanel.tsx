@@ -581,6 +581,7 @@ export function TaskEditPanel({
       <section>
         <div className="pl-1">
           <TaskAdvancedConfigEditor
+            workspacePath={task.workspacePath}
             workspaceLabel={workspaceDisplayName(task)}
             runtime={draft.runtime}
             setRuntime={(v) => setDraft((d) => ({ ...d, runtime: v }))}

@@ -312,8 +312,35 @@ interface Props {
 
 ### 3.5 已知限制（v0.2.4 范围内）
 
-- **`mcpEnabledServers` 仅落盘，运行时未生效**：UI、类型、Rust struct、`update()` 路径均已就位，但 cron 执行链（`/cron/execute-sync` → `enqueueUserMessage`）未读取 Task 级 MCP override。当前用户在派发面板设置的 MCP 启用列表会保存到 Task，但调度执行时仍读 Agent 工作区配置。此限制对应 PRD 4a「先简单点」的范围决策；后续版本接入 cron 执行链即可。
-- **TaskAdvancedConfigEditor 模型字段为自由文本**：v0.2.4 简化为单行 input，未做 provider 模型联动（与 chat 主面板的 model picker 不对齐）。后续可改为基于当前 Agent 的 provider 列表生成 CustomSelect。
+> 一轮迭代后已修复 6 项限制：MCP 端到端运行时生效、模型 picker 联动 provider、想法合并原子性（pre-flight + best-effort delete + 部分失败上报）、phantom selectedIds、@ picker 空态语境、runtime 切换字段清理。
+
+剩余限制：
+
+- **外部 Runtime 不应用任务级 MCP override**：Claude Code CLI / Codex / Gemini 等外部 Runtime 通过其自身的 CLI 标志管理 MCP，本次只为内置 SDK runtime 接通了 task-level override。外部 runtime 需要在各自适配层（`src/server/external-session.ts` 等）独立接入。
+- **任务级 provider 切换暂不支持**：模型 picker 仅展示当前 Agent 工作区所选 provider 的模型列表；用户若要任务用另一个 provider，需切换 Agent 或在工作区设置中改 provider。跨 provider 任务级切换涉及环境变量、API key 等运行时上下文，远超 v0.2.4 范围。
+
+### 3.6 架构关键点（实现细节）
+
+#### MCP 端到端设计（PRD §需求 4）
+
+```
+Task.mcp_enabled_servers (Rust)            ← 用户在 UI 配置的 override
+  ↓ task → CronTask 投影 (update_task_fields patch)
+CronTask.mcp_enabled_servers (Rust)
+  ↓ cron tick (cron_task.rs:execute_task_directly)
+CronExecutePayload.mcp_enabled_servers (Rust)
+  ↓ HTTP POST /cron/execute-sync
+payload.mcpEnabledServers (TS server)
+  ↓ withMcpOverrideAndAwaitReady() — single locked critical section
+SDK 重启并以新 MCP 集合 init → enqueueUserMessage → waitForSessionIdle
+```
+
+**关键设计**：
+
+1. **two-state 语义**：`None`/`Some([])` = 跟随 Agent；`Some([…])` = 显式覆盖。`normalize_mcp_override()` 在所有 storage 入口（create_direct / create_from_alignment / legacy migration / update）统一归一化。
+2. **每个 cron tick 强制 reconcile**：当 task 没有 override 时，cron 路径仍然显式调用 `withMcpOverrideAndAwaitReady(getEffectiveMcpServers(agentDir))`。这是为了清掉前一个任务遗留的全局 `currentMcpServers` 状态——避免"follow Agent"任务被前一个任务的 override 污染。
+3. **lock + run 锁定整个 turn**：`withMcpOverrideAndAwaitReady(target, async () => { enqueue; waitForIdle })` 保证两个并发 cron tick 不会互相 abort 对方的 in-flight turn。锁通过 `mcpOverrideQueue` chained promise 实现，`.catch(() => undefined)` 防止 rejection 污染队列。
+4. **绕开 setMcpServers 的两个保守路径**：(a) 500ms pre-warm 防抖——直接清 timer 强制立即重启；(b) snapshotted-session restart skip——helper 自己驱动 abort/await，不依赖 setMcpServers 的 deferred-restart 机制。
 
 ### 3.5 验证清单
 

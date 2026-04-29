@@ -3681,6 +3681,13 @@ pub struct CronExecutePayload {
     pub runtime: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_config: Option<serde_json::Value>,
+    /// Per-task MCP enable list override (PRD 0.2.4 §需求 4).
+    /// `None` = follow workspace MCP config (Agent's mcpEnabledServers).
+    /// `Some([...])` = enable only these server ids for this task.
+    /// Sidecar `/cron/execute-sync` applies via `setMcpServers()` before
+    /// delivering the prompt so the SDK's tool list matches the override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_enabled_servers: Option<Vec<String>>,
     /// Run mode: "single_session" (keep context) or "new_session" (fresh each time)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_mode: Option<String>,
@@ -3931,6 +3938,10 @@ pub async fn cmd_execute_cron_task(
         provider_env: providerEnv,
         runtime,
         runtime_config: runtimeConfig,
+        // Renderer-driven cron execution path doesn't carry a parent Task,
+        // so per-task MCP overrides aren't applicable here. Fall back to
+        // "follow workspace MCP" by sending None.
+        mcp_enabled_servers: None,
         run_mode: runMode,
         interval_minutes: intervalMinutes,
         execution_number: executionNumber,

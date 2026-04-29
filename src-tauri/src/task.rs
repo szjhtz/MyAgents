@@ -999,7 +999,7 @@ impl TaskStore {
             preselected_session_id: input.preselected_session_id,
             runtime: input.runtime,
             runtime_config: input.runtime_config,
-            mcp_enabled_servers: input.mcp_enabled_servers,
+            mcp_enabled_servers: normalize_mcp_override(input.mcp_enabled_servers),
             source_thought_id: input.source_thought_id,
             session_ids: Vec::new(),
             status: TaskStatus::Todo,
@@ -1132,7 +1132,7 @@ impl TaskStore {
             preselected_session_id: input.preselected_session_id,
             runtime: input.runtime,
             runtime_config: input.runtime_config,
-            mcp_enabled_servers: input.mcp_enabled_servers,
+            mcp_enabled_servers: normalize_mcp_override(input.mcp_enabled_servers),
             source_thought_id: input.source_thought_id,
             session_ids: Vec::new(),
             status: initial_status,
@@ -1316,7 +1316,7 @@ impl TaskStore {
             preselected_session_id: None,
             runtime: input.runtime,
             runtime_config: input.runtime_config,
-            mcp_enabled_servers: input.mcp_enabled_servers,
+            mcp_enabled_servers: normalize_mcp_override(input.mcp_enabled_servers),
             source_thought_id,
             session_ids: Vec::new(),
             status: TaskStatus::Todo,
@@ -1519,12 +1519,12 @@ impl TaskStore {
             updated.runtime_config = Some(v);
         }
         if let Some(v) = input.mcp_enabled_servers {
-            // Empty vec from the renderer means "explicitly run with no
-            // MCP servers"; treat that as a clear (= follow Agent default)
-            // by mapping it to None — the UI surfaces this via the user
-            // toggling the override OFF, which sends `mcpEnabledServers: []`.
-            // A non-empty list snapshots the chosen servers onto the task.
-            updated.mcp_enabled_servers = if v.is_empty() { None } else { Some(v) };
+            // Two-state semantics (PRD 0.2.4 §需求 4 — "先简单点"):
+            //   None / Some([])  → "follow Agent" (no override)
+            //   Some([a, b, …])  → snapshot the chosen servers onto the task
+            // Goes through the shared `normalize_mcp_override` helper so
+            // create / update / legacy paths all enforce the same shape.
+            updated.mcp_enabled_servers = normalize_mcp_override(Some(v));
         }
         if let Some(v) = input.tags {
             updated.tags = v;
@@ -1620,7 +1620,8 @@ impl TaskStore {
             || existing.cron_timezone != updated.cron_timezone
             || existing.dispatch_at != updated.dispatch_at;
         let exec_overrides_changed = existing.model != updated.model
-            || existing.permission_mode != updated.permission_mode;
+            || existing.permission_mode != updated.permission_mode
+            || existing.mcp_enabled_servers != updated.mcp_enabled_servers;
         let notification_changed = existing.notification != updated.notification;
         let name_or_prompt_changed = existing.name != updated.name || input.prompt.is_some();
 
@@ -1733,6 +1734,22 @@ impl TaskStore {
                                 .clone()
                                 .unwrap_or_else(|| "fullAgency".to_string()),
                         ),
+                    );
+                }
+                if existing.mcp_enabled_servers != updated.mcp_enabled_servers {
+                    // PRD 0.2.4 §需求 4 — push MCP override to the linked
+                    // CronTask so the next dispatch tick carries it forward.
+                    // null clears (= follow workspace), an array sets it.
+                    patch.insert(
+                        "mcpEnabledServers".to_string(),
+                        match updated.mcp_enabled_servers.as_ref() {
+                            Some(list) => serde_json::Value::Array(
+                                list.iter()
+                                    .map(|s| serde_json::Value::String(s.clone()))
+                                    .collect(),
+                            ),
+                            None => serde_json::Value::Null,
+                        },
                     );
                 }
                 if notification_changed {
@@ -2146,6 +2163,24 @@ impl TaskStore {
 }
 
 // ================ Helpers ================
+
+/// Normalise the per-task `mcp_enabled_servers` override at storage time
+/// (PRD 0.2.4 §需求 4 — two-state semantics).
+///
+///   `None`      → "follow Agent"      (no override stored)
+///   `Some([])`  → "follow Agent"      (collapsed: empty intent ≡ no override)
+///   `Some([…])` → "explicit override" (snapshot the chosen server ids)
+///
+/// Applied at every storage boundary (create_direct, create_from_alignment,
+/// legacy_upgrade, update) so direct API/CLI callers can never produce a
+/// `Some(vec![])` row that the rest of the code would have to special-case.
+fn normalize_mcp_override(input: Option<Vec<String>>) -> Option<Vec<String>> {
+    match input {
+        None => None,
+        Some(v) if v.is_empty() => None,
+        Some(v) => Some(v),
+    }
+}
 
 fn now_ms() -> i64 {
     Utc::now().timestamp_millis()

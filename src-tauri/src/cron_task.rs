@@ -304,6 +304,11 @@ pub struct CronTask {
     /// Runtime-scoped config snapshot for external Runtime tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_config: Option<serde_json::Value>,
+    /// Per-task MCP enable list override (PRD 0.2.4 §需求 4). Snapshot from
+    /// the parent Task at projection time. `None` = follow workspace MCP
+    /// config; `Some([...])` = enable only these server ids for the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_enabled_servers: Option<Vec<String>>,
     /// Last error message (if any)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -366,6 +371,10 @@ pub struct CronTaskConfig {
     pub runtime: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_config: Option<serde_json::Value>,
+    /// Per-task MCP enable list snapshot (PRD 0.2.4 §需求 4). Mirrors the
+    /// `Task.mcp_enabled_servers` override; `None` = follow workspace MCP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_enabled_servers: Option<Vec<String>>,
     // ===== IM Bot cron fields (v0.1.21) =====
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_bot_id: Option<String>,
@@ -1495,6 +1504,7 @@ impl CronTaskManager {
             provider_env: config.provider_env,
             runtime: config.runtime,
             runtime_config: config.runtime_config,
+            mcp_enabled_servers: config.mcp_enabled_servers,
             last_error: None,
             source_bot_id: config.source_bot_id,
             delivery: config.delivery,
@@ -1686,6 +1696,17 @@ impl CronTaskManager {
         }
         if let Some(pm) = patch.get("permissionMode").and_then(|v| v.as_str()) {
             task.permission_mode = pm.to_string();
+        }
+        // PRD 0.2.4 §需求 4 — Task → CronTask projection of MCP override.
+        // Two-state semantics (mirrors `task.rs::update`):
+        //   null OR empty array  → clear (= follow workspace)
+        //   array of ids         → set as the per-task override
+        if let Some(mcp_val) = patch.get("mcpEnabledServers") {
+            if mcp_val.is_null() {
+                task.mcp_enabled_servers = None;
+            } else if let Ok(list) = serde_json::from_value::<Vec<String>>(mcp_val.clone()) {
+                task.mcp_enabled_servers = if list.is_empty() { None } else { Some(list) };
+            }
         }
         if let Some(delivery_val) = patch.get("delivery") {
             if delivery_val.is_null() {
@@ -2333,6 +2354,7 @@ async fn execute_task_directly(
         }),
         runtime: task.runtime.clone(),
         runtime_config: task.runtime_config.clone(),
+        mcp_enabled_servers: task.mcp_enabled_servers.clone(),
         run_mode: Some(run_mode_str.to_string()),
         interval_minutes: Some(task.interval_minutes),
         execution_number: Some(execution_number),

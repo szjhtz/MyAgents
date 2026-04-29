@@ -1678,15 +1678,19 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
                     <div className="px-3 py-3 text-sm text-[var(--ink-muted)]">
                       {fileSearchQuery.length === 0
                         ? '暂无想法，先在「任务中心」记录吧'
-                        : '没有匹配的想法'}
+                        : (
+                          <>
+                            没有匹配 <span className="font-medium text-[var(--ink)]">{`"${fileSearchQuery}"`}</span> 的想法
+                          </>
+                        )}
                     </div>
                   ) : (
                     <>
-                      {fileSearchQuery.length === 0 && (
-                        <div className="px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--ink-muted)]/60">
-                          最近 {Math.min(thoughtResults.length, THOUGHT_RECENT_LIMIT)} 条想法
-                        </div>
-                      )}
+                      <div className="px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--ink-muted)]/60">
+                        {fileSearchQuery.length === 0
+                          ? `最近 ${Math.min(thoughtResults.length, THOUGHT_RECENT_LIMIT)} 条想法`
+                          : `匹配 "${fileSearchQuery}" 的想法 · ${thoughtResults.length} 条`}
+                      </div>
                       {thoughtResults.map((thought, idx) => (
                         <ThoughtPickerRow
                           key={thought.id}
