@@ -56,6 +56,35 @@ export function thoughtDelete(id: string): Promise<void> {
   return inv('cmd_thought_delete', { id });
 }
 
+/** Per-source delete failure surfaced by `thoughtMerge` — the merge itself
+ *  succeeds (the new thought is committed), but the named source's physical
+ *  delete failed. The renderer prompts the user to manually clean up. */
+export interface MergeSourceDeleteFailure {
+  id: string;
+  error: string;
+}
+
+/** Result of `thoughtMerge`. `merged` is always present; `failedSourceDeletes`
+ *  lists any sources whose physical delete failed after the merge committed. */
+export interface ThoughtMergeResult {
+  merged: Thought;
+  failedSourceDeletes: MergeSourceDeleteFailure[];
+}
+
+/**
+ * Merge multiple thoughts into one new thought, then delete the originals.
+ * `sourceIds` MUST be ordered top→bottom as displayed; the merged content
+ * is joined with `\n—\n` separators in that order. See PRD 0.2.4 §需求 2.
+ *
+ * Atomicity: the merged thought is created atomically (pre-flight + tmp/rename).
+ * Source deletes are best-effort — partial failures are surfaced via
+ * `failedSourceDeletes` rather than rolling back the merge (which would lose
+ * already-deleted source data).
+ */
+export function thoughtMerge(sourceIds: string[]): Promise<ThoughtMergeResult> {
+  return inv('cmd_thought_merge', { sourceIds });
+}
+
 /** Reveal `~/.myagents/thoughts/` in the OS file manager (Finder/Explorer). */
 export function thoughtOpenDir(): Promise<void> {
   return inv('cmd_thought_open_dir');

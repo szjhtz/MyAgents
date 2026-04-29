@@ -268,6 +268,9 @@ async fn create_cron_handler(
         provider_env: req.provider_env,
         runtime: req.runtime,
         runtime_config: req.runtime_config,
+        // Direct cron creation (legacy IM Bot path) doesn't carry a Task
+        // parent — MCP override stays None (= follow workspace).
+        mcp_enabled_servers: None,
         source_bot_id: req.source_bot_id,
         delivery: req.delivery,
         schedule: req.schedule,
@@ -1577,10 +1580,14 @@ async fn ensure_cron_for_task(ta: &task::Task) -> Result<String, String> {
         .map(cron_task::EndConditions::from)
         .unwrap_or_default();
     let desired_model = ta.model.clone();
+    // PRD 0.2.4 §需求 4 (4b): unset = runtime maximum permission, NOT
+    // "auto". Unattended task dispatch would otherwise block on the
+    // first tool call. The cron exec path translates `fullAgency` into
+    // the runtime-specific bypass mode.
     let desired_permission_mode = ta
         .permission_mode
         .clone()
-        .unwrap_or_else(|| "auto".to_string());
+        .unwrap_or_else(|| "fullAgency".to_string());
 
     // Candidate IDs: the Task's own cached `cron_task_id`, and any other
     // CronTask that carries this Task's id as a back-pointer (defensive —
@@ -1704,6 +1711,11 @@ async fn ensure_cron_for_task(ta: &task::Task) -> Result<String, String> {
         provider_env: None,
         runtime: ta.runtime.clone(),
         runtime_config: ta.runtime_config.clone(),
+        // PRD 0.2.4 §需求 4 — per-task MCP override flows through here so
+        // the dispatch payload (built in cron_task.rs::execute_task_directly)
+        // carries the override to /cron/execute-sync, which applies it via
+        // setMcpServers before delivering the prompt.
+        mcp_enabled_servers: ta.mcp_enabled_servers.clone(),
         source_bot_id: None,
         delivery,
         schedule: Some(schedule),

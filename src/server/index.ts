@@ -234,6 +234,8 @@ import {
   switchToSession,
   setMcpServers,
   getMcpServers,
+  applyMcpOverrideAndAwaitReady,
+  withCronDispatchLock,
   setAgents,
   setSessionModel,
   resetSession,
@@ -269,7 +271,7 @@ import {
   updateSessionMetadata,
   getAttachmentPath,
 } from './SessionStore';
-import { findAgentByWorkspacePath } from './utils/admin-config';
+import { findAgentByWorkspacePath, getAllMcpServers, getEffectiveMcpServers } from './utils/admin-config';
 import { snapshotForOwnedSession } from './utils/session-snapshot';
 import { resolveSessionConfig } from './utils/resolve-session-config';
 import type { AgentConfig } from '../shared/types/agent';
@@ -409,6 +411,13 @@ type CronExecutePayload = {
     maxOutputTokensParamName?: 'max_tokens' | 'max_completion_tokens' | 'max_output_tokens';
     upstreamFormat?: 'chat_completions' | 'responses';
   };
+  /**
+   * Per-task MCP enable list override (PRD 0.2.4 §需求 4).
+   * `undefined` = follow workspace MCP (`config.agents[].mcpEnabledServers`).
+   * `[id, id, ...]` = enable only these MCP server ids for this task.
+   * Sidecar applies via `setMcpServers()` before `enqueueUserMessage`.
+   */
+  mcpEnabledServers?: string[];
   /** Run mode: "single_session" (keep context) or "new_session" (fresh each time) */
   runMode?: 'single_session' | 'new_session';
   /** Task execution interval in minutes (for System Prompt context) */
@@ -2162,9 +2171,18 @@ async function main() {
               return jsonResponse({ success: false, error: runtimeResult.error ?? 'Failed to start cron via external runtime' }, 503);
             }
           } else {
-            // Cron tasks are unattended — bypass all permissions so tool requests
-            // don't block indefinitely waiting for a user who isn't present.
-            await enqueueUserMessage(wrappedPrompt, [], 'fullAgency', effectiveModel, effectiveProviderEnv);
+            // Cron tasks are unattended — by default bypass all permissions
+            // so tool requests don't block indefinitely waiting for a user
+            // who isn't present. But if the user explicitly picked a stricter
+            // mode in the task editor, honor it (PRD 0.2.4 §需求 4 — "默认
+            // 最大权限，主动选择则尊重"). Precedence: payload.permissionMode
+            // > snapshot resolved > 'fullAgency'.
+            const effectivePermissionMode = (
+              (payload.permissionMode as PermissionMode | undefined)
+              ?? (effectiveRuntimeConfig?.permissionMode as PermissionMode | undefined)
+              ?? 'fullAgency'
+            );
+            await enqueueUserMessage(wrappedPrompt, [], effectivePermissionMode, effectiveModel, effectiveProviderEnv);
           }
           // Reset scenario after enqueue — already consumed by startStreamingSession()
           resetInteractionScenario();
@@ -2201,6 +2219,14 @@ async function main() {
           return jsonResponse({ success: false, error: 'taskId and prompt are required.' }, 400);
         }
 
+        // Wrap the entire cron handler body in `withCronDispatchLock` so two
+        // concurrent ticks within a single sidecar can't interleave on
+        // shared global state — `currentMcpServers`, the active session,
+        // `cronTaskContext`, `interactionScenario`. Without this, request
+        // A's session switch / scenario could be silently overwritten by
+        // request B before A reaches `enqueueUserMessage`. PRD 0.2.4 §3.6
+        // (cross-review B7).
+        return await withCronDispatchLock(async () => {
         // Handle session setup based on runMode
         const effectiveRunMode = runMode ?? 'single_session';
         const { agentDir } = getAgentState();
@@ -2221,6 +2247,14 @@ async function main() {
           const cronSnapshot: Partial<SessionMetadata> = cronAgent ? snapshotForOwnedSession(cronAgent) : {};
           const overrideRuntime = payload.runtime ?? getActiveRuntimeType();
           if (overrideRuntime) cronSnapshot.runtime = overrideRuntime;
+          // PRD 0.2.4 §需求 4 — stamp per-task MCP override into the new
+          // session's metadata BEFORE creation, so the session is born with
+          // the right MCP set. The setMcpServers() call further down still
+          // runs for safety, but for new_session mode it's typically a
+          // no-op because the snapshot already matches the override.
+          if (payload.mcpEnabledServers !== undefined) {
+            cronSnapshot.mcpEnabledServers = payload.mcpEnabledServers;
+          }
           // Rust rotates a fresh UUID per tick for new_session mode (see
           // cron_task.rs::rotate_new_session_id) and passes it as
           // payload.sessionId. Honour that id here — if we generated our
@@ -2406,11 +2440,58 @@ async function main() {
             textContent = getLastExternalAssistantText();
           } else {
             // ─── Builtin Runtime: existing path ───
-            // Cron tasks are unattended — bypass all permissions so tool requests
-            // (e.g. Bash) don't block forever waiting for human approval.
+
+            // PRD 0.2.4 §需求 4 — reconcile MCP set + run the turn under
+            // a single locked critical section so two concurrent cron
+            // ticks never interleave their abort/restart with each
+            // other's in-flight turn (cross-review B5).
+            //
+            // Target MCP set:
+            //   1. Task carries an override → apply that exact list.
+            //   2. Task has no override ("follow Agent") → reconcile to
+            //      the workspace's effective MCP. This is critical because
+            //      `currentMcpServers` is module-global state that the
+            //      previous task's override may have mutated. Without an
+            //      explicit reset, "follow Agent" silently inherits the
+            //      previous task's override (cross-review B1).
+            //
+            // The helper is fingerprint-gated, so when the desired set
+            // already matches `currentMcpServers` it's a cheap no-op.
+            let target: McpServerDefinition[];
+            if (payload.mcpEnabledServers !== undefined) {
+              const allServers = getAllMcpServers();
+              const overrideIds = new Set(payload.mcpEnabledServers);
+              target = allServers.filter((s) => overrideIds.has(s.id));
+              console.log(
+                `[cron] execute-sync taskId=${taskId} applying task MCP override: [${
+                  target.map((s) => s.id).join(',') || '(empty)'
+                }]`,
+              );
+            } else {
+              // No override → reconcile to workspace effective MCP so a
+              // previous task's override doesn't leak into this run.
+              target = getEffectiveMcpServers(agentDir);
+            }
+
+            // Apply MCP set first (this may abort + restart the session;
+            // the outer `withCronDispatchLock` keeps two concurrent ticks
+            // from interleaving across the abort/restart window).
+            await applyMcpOverrideAndAwaitReady(target);
+
+            // Cron tasks are unattended — by default bypass all permissions
+            // so tool requests (e.g. Bash) don't block forever waiting for
+            // human approval. But if the user explicitly picked a stricter
+            // mode in the task editor, honor it (PRD 0.2.4 §需求 4 — "默认
+            // 最大权限，主动选择则尊重"). Precedence: payload.permissionMode
+            // > snapshot resolved > 'fullAgency'.
             // T15: effectiveModel / effectiveProviderEnv come from the session snapshot
             //      (single_session) or payload defaults (new_session / fallback).
-            const enqueueResult = await enqueueUserMessage(wrappedPrompt, [], 'fullAgency', effectiveModel, effectiveProviderEnv);
+            const effectivePermissionMode = (
+              (payload.permissionMode as PermissionMode | undefined)
+              ?? (effectiveRuntimeConfig?.permissionMode as PermissionMode | undefined)
+              ?? 'fullAgency'
+            );
+            const enqueueResult = await enqueueUserMessage(wrappedPrompt, [], effectivePermissionMode, effectiveModel, effectiveProviderEnv);
             console.log('[cron] execute-sync: user message enqueued, queued:', enqueueResult.queued, 'queueId:', enqueueResult.queueId);
 
             // Wait for session to become idle (execution complete)
@@ -2491,6 +2572,7 @@ async function main() {
           console.log(`[cron] execute-sync taskId=${taskId} returning error response:`, JSON.stringify(errorResponse));
           return jsonResponse(errorResponse, 500);
         }
+        }); // end withCronDispatchLock
       }
 
       // ============= GLOBAL STATS API =============
@@ -8388,7 +8470,36 @@ async function main() {
       if (pathname === '/api/im/heartbeat' && request.method === 'POST') {
         // Track drained events so they can be re-queued on pre-enqueue failures
         let drainedEvents: Array<{ event: string; content: string; timestamp: number; taskId?: string }> = [];
+        // Cron events are tracked separately because they have stricter durability —
+        // the destructive drain MUST be reverted unless the heartbeat actually produced
+        // deliverable content. Lifted to outer scope so the catch block + the response
+        // helper below can both reach it without re-deriving from drainedEvents.
+        let cronEvents: Array<{ event: string; content: string; timestamp: number; taskId?: string }> = [];
         let messageEnqueued = false;
+
+        // Cron events represent durable work that MUST reach Feishu/IM — anything
+        // short of `status === 'content'` (silent / error / timeout / HEARTBEAT_OK
+        // false-strip) means the AI didn't relay them, and the destructive drain
+        // we did at the top of this handler would otherwise lose them forever.
+        // Wrap every post-drain return through this helper so the failure paths
+        // (timeout, no_response, empty text, AI error, stripHeartbeatToken silent)
+        // automatically push the events back into the in-memory queue. The next
+        // heartbeat (interval or wake) will retry. Sets cronEvents=[] after re-queue
+        // so the catch block doesn't double-push if a later step throws.
+        const respondAfterDrain = (
+          resp: { status: string; text?: string; reason?: string },
+          code?: number,
+        ): Response => {
+          if (cronEvents.length > 0 && resp.status !== 'content') {
+            for (const e of cronEvents) pushSystemEvent(e);
+            console.warn(
+              `[im/heartbeat] Re-queued ${cronEvents.length} cron event(s) for retry (status=${resp.status}${resp.reason ? ` reason=${resp.reason}` : ''})`,
+            );
+            cronEvents = [];
+          }
+          return jsonResponse(resp, code);
+        };
+
         try {
           const payload = await request.json() as {
             prompt: string;
@@ -8398,6 +8509,12 @@ async function main() {
             isHighPriority?: boolean;
             runtime?: RuntimeType;
             runtimeConfig?: RuntimeConfig;
+            // v0.2.4: Rust-side authoritative cron events. When non-empty, this
+            // payload is the truth source and REPLACES any cron events in the
+            // sidecar's in-memory `systemEventQueue` (Rust survives sidecar
+            // restarts; the queue does not). Non-cron events still flow through
+            // the queue. Field is camelCase to match the Rust serde attr.
+            pendingCronEvents?: Array<{ event: string; taskId: string; content: string; timestamp: number }>;
           };
 
           if (!payload.prompt) {
@@ -8430,27 +8547,104 @@ description: >
             }
           }
 
-          // Drain pending system events
+          // Drain pending system events from the in-memory queue. This is the
+          // legacy transport buffer for non-cron events; cron events used to flow
+          // here too but are now sourced from the request body (Rust truth).
           drainedEvents = drainSystemEvents();
 
-          // Separate cron events from other events
-          const cronEvents = drainedEvents.filter(e => e.event === 'cron_complete');
+          // Cron events come from two possible sources:
+          //   - body.pendingCronEvents (Rust truth, v0.2.4+; durable across
+          //     sidecar restarts, cleared from Rust on confirmed IM push)
+          //   - systemEventQueue (legacy pre-v0.2.4 path; events that survived
+          //     a partial migration or arrived via /api/im/system-event POSTs
+          //     from older callers)
+          //
+          // We merge both sets, with body as the truth source for any taskId
+          // that appears in both (Rust handles those — re-queuing the queue
+          // copy would only duplicate the AI prompt). Queue cron events whose
+          // taskId is NOT in the body are processed alongside as legacy work
+          // and remain subject to the existing respondAfterDrain re-queue path
+          // for at-least-once retry through the sidecar's own queue.
+          const bodyCronEvents = (payload.pendingCronEvents ?? []).map(e => ({
+            event: e.event,
+            content: e.content,
+            timestamp: e.timestamp,
+            taskId: e.taskId,
+          }));
+          const queueCronEventsAll = drainedEvents.filter(e => e.event === 'cron_complete');
           const otherEvents = drainedEvents.filter(e => e.event !== 'cron_complete');
 
-          // Skip AI call if HEARTBEAT.md is empty AND no system events.
-          // Always skip regardless of priority — CronComplete events are in drainedEvents
-          // so they won't be affected. The isHighPriority flag is for bypassing per-channel
-          // enabled=false gate (agent-level heartbeat delegation), NOT for skipping this check.
-          if (!heartbeatMdContent && drainedEvents.length === 0) {
+          const bodyTaskIds = new Set(
+            bodyCronEvents.map(e => e.taskId).filter((id): id is string => !!id),
+          );
+          const orphanQueueCron = queueCronEventsAll.filter(
+            e => !e.taskId || !bodyTaskIds.has(e.taskId),
+          );
+
+          // CRITICAL: process AT MOST ONE cron event per heartbeat (across body
+          // and queue combined). Reason: AI partial-relay defense — if we
+          // batched N events into one prompt and the AI relayed only some, the
+          // success path (Rust clears all body snapshot entries, sidecar drains
+          // queue events) would silently drop the un-relayed ones. By forcing
+          // exactly one event in the prompt, every "content" response
+          // corresponds to exactly one ack-able delivery.
+          //
+          // Selection priority: body[0] > orphanQueueCron[0]. body events are
+          // Rust-truth and will be re-shipped on subsequent heartbeats; orphan
+          // queue events that lose this round are pushed back into the
+          // sidecar queue immediately so the next heartbeat picks them up.
+          let effectiveCronEvents: Array<{ event: string; content: string; timestamp: number; taskId?: string }> = [];
+
+          if (bodyCronEvents.length > 0) {
+            effectiveCronEvents = [bodyCronEvents[0]];
+            // Any extra body events (Rust would only ship 1 in practice, but be
+            // defensive in case the contract changes) go nowhere here — Rust
+            // will resend them on the next heartbeat from its own pending vec.
+            if (bodyCronEvents.length > 1) {
+              console.log(
+                `[im/heartbeat] Body shipped ${bodyCronEvents.length} cron events; processing first only (Rust resends rest)`,
+              );
+            }
+            // Push orphan queue events back so they get a turn next heartbeat.
+            // (We can't use the respondAfterDrain rollback path for them
+            // because we're going to return 'content' — that's a "success" from
+            // the queue's perspective, even though we didn't actually process
+            // these orphan events this round.)
+            for (const e of orphanQueueCron) pushSystemEvent(e);
+            // No queue cron events left for the rollback helper to manage.
+            cronEvents = [];
+          } else if (orphanQueueCron.length > 0) {
+            effectiveCronEvents = [orphanQueueCron[0]];
+            // Push the rest back for next heartbeat.
+            for (let i = 1; i < orphanQueueCron.length; i++) {
+              pushSystemEvent(orphanQueueCron[i]);
+            }
+            // The one event we ARE processing must be visible to the
+            // respondAfterDrain rollback path so silent/error responses re-queue
+            // it (queue cron events are sidecar-owned and need this rollback to
+            // survive; body cron events have Rust holding them already).
+            cronEvents = [orphanQueueCron[0]];
+          }
+          // else: both empty → effectiveCronEvents stays [], cronEvents stays []
+
+          // Skip AI call if HEARTBEAT.md is empty AND no system events of any kind.
+          // Body-sourced cron events count too — Rust ships them when there's
+          // pending work, so an empty HEARTBEAT.md plus zero events on both
+          // sources means there is genuinely nothing to do.
+          if (
+            !heartbeatMdContent
+            && drainedEvents.length === 0
+            && bodyCronEvents.length === 0
+          ) {
             console.log('[im/heartbeat] Skipped: HEARTBEAT.md is empty and no pending events');
             return jsonResponse({ status: 'silent', reason: 'empty_heartbeat_md' });
           }
 
           let enrichedPrompt: string;
 
-          if (cronEvents.length > 0) {
+          if (effectiveCronEvents.length > 0) {
             // Cron event prompt: completely replaces standard heartbeat prompt
-            enrichedPrompt = buildCronEventPrompt(cronEvents);
+            enrichedPrompt = buildCronEventPrompt(effectiveCronEvents);
             // Push back non-cron events so they aren't lost — next heartbeat cycle will pick them up
             for (const e of otherEvents) {
               pushSystemEvent(e);
@@ -8496,17 +8690,17 @@ description: >
               },
             );
             if (!ccResult.queued) {
-              return jsonResponse({ status: 'error', text: ccResult.error ?? 'External runtime failed' });
+              return respondAfterDrain({ status: 'error', text: ccResult.error ?? 'External runtime failed' });
             }
             messageEnqueued = true;
 
             const completed = await waitForExternalSessionIdle(300000, 500);
             if (!completed) {
-              return jsonResponse({ status: 'error', text: 'Heartbeat timeout' });
+              return respondAfterDrain({ status: 'error', text: 'Heartbeat timeout' });
             }
 
             if (!didLastTurnSucceed()) {
-              return jsonResponse({ status: 'error', text: 'External runtime turn failed' });
+              return respondAfterDrain({ status: 'error', text: 'External runtime turn failed' });
             }
 
             text = getLastExternalAssistantText();
@@ -8528,13 +8722,13 @@ description: >
 
             const completed = await waitForSessionIdle(300000, 500);
             if (!completed) {
-              return jsonResponse({ status: 'error', text: 'Heartbeat timeout' });
+              return respondAfterDrain({ status: 'error', text: 'Heartbeat timeout' });
             }
 
             const messages = getMessages();
             const lastMsg = [...messages].reverse().find(m => m.role === 'assistant');
             if (!lastMsg) {
-              return jsonResponse({ status: 'silent', reason: 'no_response' });
+              return respondAfterDrain({ status: 'silent', reason: 'no_response' });
             }
 
             if (typeof lastMsg.content === 'string') {
@@ -8551,22 +8745,38 @@ description: >
           // (SDK wraps API errors as synthetic assistant messages with empty content in messages[])
           if (!text.trim()) {
             const agentErr = getAndClearLastAgentError();
-            return jsonResponse({ status: 'error', text: agentErr || 'AI did not respond' });
+            return respondAfterDrain({ status: 'error', text: agentErr || 'AI did not respond' });
           }
 
           // Check HEARTBEAT_OK
           const ackMaxChars = payload.ackMaxChars ?? 300;
           const result = stripHeartbeatToken(text, ackMaxChars);
 
-          return jsonResponse(result);
+          // Note: when cron events were drained, a 'silent' result here means the AI
+          // received the cron prompt but still replied with HEARTBEAT_OK (or empty
+          // after strip). respondAfterDrain treats that as undelivered and re-queues
+          // — the next heartbeat retries instead of silently dropping the daily report.
+          return respondAfterDrain(result);
         } catch (error) {
-          // Re-queue drained events only if they weren't yet sent to the AI
-          // (after enqueueUserMessage, events are in the AI prompt — re-queuing would duplicate)
-          if (!messageEnqueued && drainedEvents.length > 0) {
-            for (const e of drainedEvents) {
-              pushSystemEvent(e);
+          // Cron events represent durable work that MUST reach IM. On exception, even
+          // if `messageEnqueued = true`, the AI relay didn't complete — re-queue them
+          // unconditionally so the next heartbeat retries. The respondAfterDrain helper
+          // clears `cronEvents` after handling its own re-queue path; if it ran first,
+          // this no-ops.
+          if (cronEvents.length > 0) {
+            for (const e of cronEvents) pushSystemEvent(e);
+            console.warn(`[im/heartbeat] Re-queued ${cronEvents.length} cron event(s) after exception`);
+            cronEvents = [];
+          }
+          // Non-cron events: keep existing semantics — only re-queue if exception
+          // happened before enqueueUserMessage (otherwise they're already in the AI's
+          // prompt and re-queuing would duplicate).
+          if (!messageEnqueued) {
+            const others = drainedEvents.filter(e => e.event !== 'cron_complete');
+            if (others.length > 0) {
+              for (const e of others) pushSystemEvent(e);
+              console.warn(`[im/heartbeat] Re-queued ${others.length} non-cron event(s) after pre-enqueue failure`);
             }
-            console.warn(`[im/heartbeat] Re-queued ${drainedEvents.length} drained events after pre-enqueue failure`);
           }
           console.error('[im/heartbeat] Error:', error);
           return jsonResponse(

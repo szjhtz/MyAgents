@@ -19,10 +19,11 @@
 // needs a separate "遗留" pill — see <TaskCategoryBadge legacy />.
 
 import { useEffect, useState } from 'react';
-import { Folder } from 'lucide-react';
+import { Folder, MessageCircle } from 'lucide-react';
 
 import { taskGetRunStats } from '@/api/taskCenter';
 import type { Task, TaskExecutionMode, TaskRunStats } from '@/../shared/types/task';
+import { CUSTOM_EVENTS } from '@/../shared/constants';
 import { humanizeCron, relativeTime } from '@/utils/taskCenterUtils';
 import { TaskCategoryBadge } from '../TaskCategoryBadge';
 import { TaskStatusBadge } from '../TaskStatusBadge';
@@ -114,7 +115,8 @@ export function TaskCardItem(props: TaskCardItemProps) {
       <div className="flex w-full items-center gap-1.5">
         <TaskStatusBadge status={status} />
         <TaskCategoryBadge mode={category} legacy={isLegacy} />
-        <div className="ml-auto shrink-0">
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          <ViewSessionButton task={task} />
           <TaskItemActions
             variant={isLegacy ? 'legacy' : 'task'}
             status={status}
@@ -236,20 +238,28 @@ function MetaRow({
  * vocabulary the detail overlay uses for the "来自想法" source quote,
  * so the two surfaces read as related. Status colour is carried by the
  * status badge above; this bar doesn't re-encode it.
+ *
+ * Single-line clamp keeps every card the same height regardless of how
+ * verbose the latest message is — the full text is available on hover
+ * tooltip and inside the detail overlay's status timeline.
  */
 function ActivityBar({ message }: { message: string }) {
-  // Softer wash than solid `--paper-inset`. Tailwind's `/60` alpha
-  // modifier doesn't resolve against arbitrary CSS vars, so we go
-  // through color-mix instead.
+  // Softer wash than solid `--paper-inset`. Single-element truncate
+  // (rather than flex + inner span) — wrapping the text in a flex row
+  // would make the inner span a flex item with `min-width: auto`, and
+  // the long Chinese run would push the outer card past its width.
+  // `block` + `truncate` directly on the bordered container avoids that
+  // entire class of overflow bug.
   return (
     <div
-      className="flex items-start gap-2 rounded-r-[var(--radius-sm)] border-l-2 border-[var(--line-strong)] px-2.5 py-1.5 text-[12px] leading-snug text-[var(--ink-muted)]"
+      className="block w-full min-w-0 truncate rounded-r-[var(--radius-sm)] border-l-2 border-[var(--line)] px-2.5 py-1 text-[12px] leading-snug text-[var(--ink-muted)]"
       style={{
         backgroundColor:
-          'color-mix(in srgb, var(--paper-inset) 55%, var(--paper-elevated))',
+          'color-mix(in srgb, var(--paper-inset) 35%, var(--paper-elevated))',
       }}
+      title={message}
     >
-      <span className="line-clamp-2">{message}</span>
+      {message}
     </div>
   );
 }
@@ -311,6 +321,48 @@ function formatAbsolute(ts: number): string {
 // the chip picker emits (daily / weekdays / specific weekdays / weekly /
 // monthly) plus interval mode; anything else (custom cron the user typed)
 // falls back to the raw string so we stay honest rather than mis-translate.
+/**
+ * Hover-only chip that opens the task's most-recent SDK session in a new
+ * Chat tab. Renders nothing when the task has no recorded sessions yet
+ * (PRD 0.2.4 §需求 5: 「无数据不渲染」). The "most recent" is the last
+ * id appended to `task.sessionIds` — `task.rs::append_session` appends
+ * in execution order so the tail is authoritative.
+ *
+ * Visual vocabulary mirrors the thought-card hover actions ("AI 讨论"
+ * etc.): icon + label chip with a dark-pill tooltip on hover. Shared by
+ * both TaskCardItem and TaskListRow so the affordance is placed
+ * identically (immediately left of the ⋯ overflow trigger).
+ */
+export function ViewSessionButton({ task }: { task?: Task }) {
+  if (!task || task.sessionIds.length === 0) return null;
+  const sessionId = task.sessionIds[task.sessionIds.length - 1];
+  const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
+    e.stopPropagation();
+    if (!task.workspacePath) return;
+    window.dispatchEvent(
+      new CustomEvent(CUSTOM_EVENTS.OPEN_SESSION_IN_NEW_TAB, {
+        detail: { sessionId, workspacePath: task.workspacePath },
+      }),
+    );
+  };
+  return (
+    <div className="group/view-session relative opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+      <button
+        type="button"
+        onClick={handleClick}
+        aria-label="查看会话详情"
+        className="flex items-center gap-1 rounded-[var(--radius-md)] px-2 py-0.5 text-[12px] text-[var(--ink-muted)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--accent-cool)]"
+      >
+        <MessageCircle className="h-3.5 w-3.5" strokeWidth={1.5} />
+        会话详情
+      </button>
+      <span className="pointer-events-none absolute -bottom-7 left-1/2 z-30 -translate-x-1/2 whitespace-nowrap rounded-md bg-[var(--button-dark-bg)] px-2 py-0.5 text-[11px] text-[var(--button-primary-text)] opacity-0 shadow-lg transition-opacity group-hover/view-session:opacity-100">
+        查看会话详情
+      </span>
+    </div>
+  );
+}
+
 function formatRecurring(task?: Task): string | null {
   if (!task) return null;
   if (task.cronExpression) {

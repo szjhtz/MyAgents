@@ -1210,6 +1210,104 @@ export async function initSocksBridgeFromEnv(): Promise<void> {
 }
 
 /**
+ * Critical-section mutex for cron task dispatch (PRD 0.2.4 §需求 4 — cross-
+ * review B2 / B5 / B6 / B7). Wraps the ENTIRE cron handler body — session
+ * switch, context setup, MCP apply, enqueue, wait-for-idle — so two
+ * concurrent cron ticks within a single sidecar can't interleave on any
+ * shared global state (currentMcpServers, sessionId, cronTaskContext,
+ * interactionScenario). Each waiter chains onto the previous promise so
+ * callers see a strictly serial execution order.
+ */
+let cronDispatchQueue: Promise<unknown> = Promise.resolve();
+
+/**
+ * Run `fn()` under the cron-dispatch mutex. Used by `/cron/execute-sync`
+ * to atomically execute a cron tick — session switch, MCP reconcile,
+ * prompt enqueue, idle wait — without interleaving with another tick.
+ */
+export async function withCronDispatchLock<T>(fn: () => Promise<T>): Promise<T> {
+  const next = cronDispatchQueue.catch(() => undefined).then(() => fn());
+  // Track the chain as `Promise<unknown>` so the queue type stays uniform
+  // across heterogeneous T's; the typed result still flows back via `next`.
+  // `.catch` on the stored chain prevents a rejected turn from poisoning
+  // subsequent waiters.
+  cronDispatchQueue = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  return next;
+}
+
+/**
+ * Apply an MCP set synchronously and ensure a fresh SDK session is live —
+ * used inside `withCronDispatchLock` when the cron path needs to switch
+ * MCP for this task (or reconcile back to workspace defaults from a prior
+ * task's override).
+ *
+ * Why a dedicated helper instead of `setMcpServers`:
+ *   1. `setMcpServers`'s restart path is debounced 500ms via the pre-warm
+ *      timer so rapid `/api/mcp/set` calls (React state-sync) don't thrash
+ *      the subprocess. Cron has the OPPOSITE need — the very next
+ *      `enqueueUserMessage` MUST run against the new MCP set with no race
+ *      window. This helper bypasses the debounce.
+ *   2. `setMcpServers` skips restart entirely when the current session is
+ *      snapshotted (session metadata claims authority over MCP). For cron
+ *      we ARE the authority — the task override IS the new "session list" —
+ *      so the snapshot guard would silently no-op us. This helper bypasses
+ *      that guard by triggering the restart itself rather than relying on
+ *      the deferred-restart machinery.
+ *
+ * Behaviour:
+ *   - Calls `setMcpServers(servers)` to update `currentMcpServers`.
+ *   - If the MCP fingerprint changed AND a session is live: cancels the
+ *     pre-warm timer, drains the deferred-restart reasons, aborts the
+ *     persistent session, awaits termination, kicks off a fresh
+ *     `startStreamingSession(true)`, and polls until the new session
+ *     handle is assigned (`querySession !== null` and
+ *     `shouldAbortSession === false`).
+ *   - No-op when fingerprint is unchanged.
+ *   - When no session was running, leaves the stored config in place and
+ *     lets the next `enqueueUserMessage` start a session as usual.
+ *
+ * Caller MUST hold `withCronDispatchLock` — this helper does not
+ * serialise itself; concurrent calls would race on `querySession`.
+ */
+export async function applyMcpOverrideAndAwaitReady(servers: McpServerDefinition[]): Promise<void> {
+  const before = mcpConfigFingerprint(currentMcpServers ?? []);
+  const after = mcpConfigFingerprint(servers);
+  setMcpServers(servers);
+  if (before === after) return;
+  if (!querySession) return; // no live session — next enqueueUserMessage starts one with the current fingerprint
+  // Live session with a different MCP fingerprint — force restart.
+  if (preWarmTimer) {
+    clearTimeout(preWarmTimer);
+    preWarmTimer = null;
+  }
+  drainDeferredRestart(); // clear any leftover reasons; we drive restart
+  console.log('[agent] applyMcpOverrideAndAwaitReady: forcing immediate session restart for MCP change');
+  abortPersistentSession();
+  await awaitSessionTermination(10_000, 'applyMcpOverrideAndAwaitReady');
+
+  // After termination `shouldAbortSession` is still true and there is no
+  // live SDK process. If `enqueueUserMessage` ran now, it would treat
+  // `shouldAbortSession` as busy and queue — and `waitForSessionIdle`
+  // would return prematurely (sessionState === 'idle' immediately) before
+  // the queued message ran. Force a fresh subprocess and poll until the
+  // SDK session handle is assigned.
+  void startStreamingSession(true).catch((error) => {
+    console.error('[agent] applyMcpOverrideAndAwaitReady: post-abort restart failed:', error);
+  });
+  const restartDeadline = Date.now() + 10_000;
+  while (Date.now() < restartDeadline) {
+    if (querySession && !shouldAbortSession) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  if (!querySession || shouldAbortSession) {
+    console.warn('[agent] applyMcpOverrideAndAwaitReady: timed out waiting for new session');
+  }
+}
+
+/**
  * Set the MCP servers to use for subsequent queries
  * Called from renderer when user toggles MCP in workspace
  * If MCP config changed and a session is running, it will be restarted with resume

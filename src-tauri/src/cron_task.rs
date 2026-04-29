@@ -304,6 +304,11 @@ pub struct CronTask {
     /// Runtime-scoped config snapshot for external Runtime tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_config: Option<serde_json::Value>,
+    /// Per-task MCP enable list override (PRD 0.2.4 §需求 4). Snapshot from
+    /// the parent Task at projection time. `None` = follow workspace MCP
+    /// config; `Some([...])` = enable only these server ids for the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_enabled_servers: Option<Vec<String>>,
     /// Last error message (if any)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -366,6 +371,10 @@ pub struct CronTaskConfig {
     pub runtime: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_config: Option<serde_json::Value>,
+    /// Per-task MCP enable list snapshot (PRD 0.2.4 §需求 4). Mirrors the
+    /// `Task.mcp_enabled_servers` override; `None` = follow workspace MCP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_enabled_servers: Option<Vec<String>>,
     // ===== IM Bot cron fields (v0.1.21) =====
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_bot_id: Option<String>,
@@ -1495,6 +1504,7 @@ impl CronTaskManager {
             provider_env: config.provider_env,
             runtime: config.runtime,
             runtime_config: config.runtime_config,
+            mcp_enabled_servers: config.mcp_enabled_servers,
             last_error: None,
             source_bot_id: config.source_bot_id,
             delivery: config.delivery,
@@ -1686,6 +1696,17 @@ impl CronTaskManager {
         }
         if let Some(pm) = patch.get("permissionMode").and_then(|v| v.as_str()) {
             task.permission_mode = pm.to_string();
+        }
+        // PRD 0.2.4 §需求 4 — Task → CronTask projection of MCP override.
+        // Two-state semantics (mirrors `task.rs::update`):
+        //   null OR empty array  → clear (= follow workspace)
+        //   array of ids         → set as the per-task override
+        if let Some(mcp_val) = patch.get("mcpEnabledServers") {
+            if mcp_val.is_null() {
+                task.mcp_enabled_servers = None;
+            } else if let Ok(list) = serde_json::from_value::<Vec<String>>(mcp_val.clone()) {
+                task.mcp_enabled_servers = if list.is_empty() { None } else { Some(list) };
+            }
         }
         if let Some(delivery_val) = patch.get("delivery") {
             if delivery_val.is_null() {
@@ -2333,6 +2354,7 @@ async fn execute_task_directly(
         }),
         runtime: task.runtime.clone(),
         runtime_config: task.runtime_config.clone(),
+        mcp_enabled_servers: task.mcp_enabled_servers.clone(),
         run_mode: Some(run_mode_str.to_string()),
         interval_minutes: Some(task.interval_minutes),
         execution_number: Some(execution_number),
@@ -2869,9 +2891,24 @@ pub async fn deliver_task_notification_to_bot_checked(
     true
 }
 
-/// Deliver cron task completion result to IM Bot (v0.1.21)
-/// 1. POST system event to the Bot's Sidecar for heartbeat to pick up
-/// 2. Wake the Bot's heartbeat runner
+/// Deliver cron task completion result to IM Bot.
+///
+/// **v0.2.4 redesign:** the cron event payload now lives in
+/// `ImBotInstance.pending_cron_events` (Rust-side, durable across sidecar
+/// process restarts). The heartbeat runner snapshots that vec on each cycle
+/// and ships it to the sidecar via heartbeat HTTP body, then clears delivered
+/// entries only after the IM platform actually accepted the relay. This makes
+/// the cron→IM hand-off at-least-once — sidecar death, AI silent reply, and
+/// `push_text_preferring_stream` failure all leave the entry pending for the
+/// next heartbeat to retry.
+///
+/// Steps:
+///   1. Append a `PendingCronEvent` to the bot's pending vec.
+///   2. Wake the heartbeat runner (which will deliver it).
+///
+/// (The legacy POST `/api/im/system-event` + sidecar `systemEventQueue` path
+/// is no longer used for cron events. Sidecar still accepts that endpoint for
+/// other event kinds — body field takes precedence when both are present.)
 async fn deliver_cron_result_to_bot(
     handle: &AppHandle,
     delivery: &CronDelivery,
@@ -2883,8 +2920,9 @@ async fn deliver_cron_result_to_bot(
         task_id, delivery.bot_id, delivery.platform
     );
 
-    // 1. Find the Bot's sidecar port and POST system event
-    // First check ManagedAgents (v0.1.41), then fall back to ManagedImBots (legacy)
+    // Look up the bot's pending vec + wake channel. We try the Agent state
+    // first (v0.1.41 channels), then fall back to legacy ManagedImBots. Both
+    // ultimately point at the same per-channel ImBotInstance Arc fields.
     let im_state: tauri::State<'_, crate::im::ManagedImBots> = match handle.try_state() {
         Some(s) => s,
         None => {
@@ -2893,22 +2931,14 @@ async fn deliver_cron_result_to_bot(
         }
     };
 
-    // Extract Arc refs from instance, then drop guard early to avoid
-    // holding the lock during potentially slow ensure_sidecar (~2s).
-    let (router, current_model, current_provider_env, mcp_servers_json, runtime, runtime_config, wake_tx) = {
-        // Try Agent state first (v0.1.41)
+    let (pending_cron_events, wake_tx) = {
         let agent_refs = if let Some(agent_state) = handle.try_state::<crate::im::ManagedAgents>() {
             let agents_guard = agent_state.lock().await;
             let mut found = None;
             for (_agent_id, agent) in agents_guard.iter() {
                 if let Some(ch) = agent.channels.get(&delivery.bot_id) {
                     found = Some((
-                        std::sync::Arc::clone(&ch.bot_instance.router),
-                        std::sync::Arc::clone(&ch.bot_instance.current_model),
-                        std::sync::Arc::clone(&ch.bot_instance.current_provider_env),
-                        std::sync::Arc::clone(&ch.bot_instance.mcp_servers_json),
-                        std::sync::Arc::clone(&ch.bot_instance.runtime),
-                        std::sync::Arc::clone(&ch.bot_instance.runtime_config),
+                        std::sync::Arc::clone(&ch.bot_instance.pending_cron_events),
                         ch.bot_instance.heartbeat_wake_tx.clone(),
                     ));
                     break;
@@ -2922,7 +2952,6 @@ async fn deliver_cron_result_to_bot(
         if let Some(refs) = agent_refs {
             refs
         } else {
-            // Fall back to legacy ManagedImBots
             let im_guard = im_state.lock().await;
             let instance = match im_guard.get(&delivery.bot_id) {
                 Some(i) => i,
@@ -2937,82 +2966,43 @@ async fn deliver_cron_result_to_bot(
                 }
             };
             (
-                std::sync::Arc::clone(&instance.router),
-                std::sync::Arc::clone(&instance.current_model),
-                std::sync::Arc::clone(&instance.current_provider_env),
-                std::sync::Arc::clone(&instance.mcp_servers_json),
-                std::sync::Arc::clone(&instance.runtime),
-                std::sync::Arc::clone(&instance.runtime_config),
+                std::sync::Arc::clone(&instance.pending_cron_events),
                 instance.heartbeat_wake_tx.clone(),
             )
         }
     }; // guards dropped here
 
-    let sidecar_manager = match handle.try_state::<ManagedSidecarManager>() {
-        Some(s) => s,
-        None => {
-            ulog_warn!("[CronTask] Cannot deliver result: SidecarManager state not available");
-            return;
+    // 1. Append to pending. Cap to keep memory bounded if the bot is offline
+    // for an extended period — daily reports are 1/day so 50 covers ~7 weeks
+    // before the oldest gets evicted (FIFO). Eviction logs a warning so the
+    // operator notices delivery is silently dropping.
+    const MAX_PENDING_CRON_EVENTS: usize = 50;
+    {
+        let mut pending = pending_cron_events.lock().await;
+        while pending.len() >= MAX_PENDING_CRON_EVENTS {
+            let evicted = pending.remove(0);
+            ulog_warn!(
+                "[CronTask] pending_cron_events at cap ({}) for bot {} — evicting oldest task_id={}",
+                MAX_PENDING_CRON_EVENTS, delivery.bot_id, evicted.task_id
+            );
         }
-    };
-
-    // 1. Ensure sidecar is running and POST system event.
-    // Same ensure_sidecar pattern as heartbeat — if sidecar was idle-collected, wake it up
-    // so the system event is stored in-process memory before heartbeat drains it.
-    let session_key = {
-        let router_guard = router.lock().await;
-        router_guard.find_any_peer_session().map(|(key, _, _)| key)
-    };
-
-    if let Some(session_key) = session_key {
-        let (port, is_new_sidecar) = {
-            let mut router_guard = router.lock().await;
-            match router_guard.ensure_sidecar(&session_key, handle, &sidecar_manager).await {
-                Ok(result) => result,
-                Err(e) => {
-                    ulog_warn!("[CronTask] Failed to ensure sidecar for bot {}: {}", delivery.bot_id, e);
-                    // Still try to wake heartbeat below
-                    (0, false)
-                }
-            }
-        };
-
-        // Sync AI config for newly created sidecar
-        if is_new_sidecar && port > 0 {
-            let model = current_model.read().await.clone();
-            let penv = current_provider_env.read().await.clone();
-            let mcp = mcp_servers_json.read().await.clone();
-            let runtime = runtime.read().await.clone();
-            let runtime_config = runtime_config.read().await.clone();
-            router.lock().await
-                .sync_ai_config(
-                    port,
-                    &runtime,
-                    runtime_config.as_ref(),
-                    model.as_deref(),
-                    mcp.as_deref(),
-                    penv.as_ref(),
-                )
-                .await;
-            ulog_info!("[CronTask] Woke up sidecar for bot {} on port {}", delivery.bot_id, port);
-        }
-
-        if port > 0 {
-            let client = crate::local_http::builder().build().unwrap_or_default();
-            let url = format!("http://127.0.0.1:{}/api/im/system-event", port);
-            let body = serde_json::json!({
-                "event": "cron_complete",
-                "content": summary,
-                "taskId": task_id,
-            });
-            match client.post(&url).json(&body).send().await {
-                Ok(_) => ulog_info!("[CronTask] Delivered system event to bot {} sidecar", delivery.bot_id),
-                Err(e) => ulog_warn!("[CronTask] Failed to deliver system event: {}", e),
-            }
-        }
+        pending.push(crate::im::types::PendingCronEvent {
+            event: "cron_complete".to_string(),
+            task_id: task_id.to_string(),
+            content: summary.to_string(),
+            // Local-side timestamp; only used internally as a dedup-clear
+            // disambiguator, never displayed to the user.
+            timestamp: chrono::Utc::now().timestamp_millis().max(0) as u64,
+        });
+        ulog_info!(
+            "[CronTask] Appended cron event to bot {} pending (now {} pending)",
+            delivery.bot_id, pending.len()
+        );
     }
 
-    // 2. Wake the heartbeat runner
+    // 2. Wake the heartbeat runner. The wake reason still carries (task_id,
+    // summary) for log readability; the heartbeat runner reads pending from
+    // the Arc directly, not from the wake reason.
     if let Some(ref wake_tx) = wake_tx {
         let reason = crate::im::types::WakeReason::CronComplete {
             task_id: task_id.to_string(),
@@ -3023,6 +3013,12 @@ async fn deliver_cron_result_to_bot(
         } else {
             ulog_info!("[CronTask] Heartbeat wake sent for bot {}", delivery.bot_id);
         }
+    } else {
+        ulog_warn!(
+            "[CronTask] Bot {} has no heartbeat_wake_tx — cron event will sit in \
+             pending until next interval tick (up to heartbeat interval)",
+            delivery.bot_id
+        );
     }
 }
 

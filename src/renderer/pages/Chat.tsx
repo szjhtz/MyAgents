@@ -47,6 +47,7 @@ import {
 import { patchAgentConfig, getAgentById } from '@/config/services/agentConfigService';
 import type { AgentConfig } from '../../shared/types/agent';
 import { BrowserPanelContext } from '@/context/BrowserPanelContext';
+import { BROWSER_BLANK_URL } from '@/components/browserConstants';
 import { CUSTOM_EVENTS, isPendingSessionId } from '../../shared/constants';
 import type { CapabilityInitialSelect } from '../../shared/skillsTypes';
 import { CC_MODELS, CC_PERMISSION_MODES, CODEX_PERMISSION_MODES, GEMINI_PERMISSION_MODES, getDefaultRuntimePermissionMode, getRuntimePermissionModes } from '../../shared/types/runtime';
@@ -303,6 +304,13 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
   const [browserAlive, setBrowserAlive] = useState(false);
   // When browser is previewing a local file, store its metadata for editor toggle
   const [browserSourceFile, setBrowserSourceFile] = useState<{ name: string; content: string; size: number; path: string } | null>(null);
+  // Live URL surfaced from BrowserPanel (Rust `browser:url-changed`). Drives
+  // the split-view tab label; `browserUrl` is the seed URL only and never
+  // updates after navigation.
+  const [browserCurrentUrl, setBrowserCurrentUrl] = useState<string>('');
+  const handleBrowserUrlChange = useCallback((u: string) => {
+    setBrowserCurrentUrl(u);
+  }, []);
 
   // ── Introduction overlay: read INTRODUCTION.md per agentDir/sessionId ──
   // sessionId in deps → re-reads when user creates a new session (so edits via settings are reflected)
@@ -355,6 +363,7 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
       setBrowserUrl(null);
       setBrowserAlive(false);
       setBrowserSourceFile(null);
+      setBrowserCurrentUrl('');
       if (terminalPinned && terminalAlive) setSplitActiveView('terminal');
       else if (splitFile) setSplitActiveView('file');
       return true;
@@ -396,16 +405,27 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
     setSplitActiveView('browser');
   }, []);
 
+  // Open empty browser from toolbar button.
+  // First click → create blank webview (BROWSER_BLANK_URL is a data: URL, not
+  // about:blank — see browserConstants.ts for why). Subsequent clicks just
+  // switch view (URL preserved).
+  const handleOpenBrowser = useCallback(() => {
+    setBrowserUrl((prev) => prev ?? BROWSER_BLANK_URL);
+    setSplitActiveView('browser');
+  }, []);
+
   const handleBrowserCreated = useCallback(() => setBrowserAlive(true), []);
   const handleBrowserCreateFailed = useCallback(() => {
     setBrowserAlive(false);
     setBrowserUrl(null);
     setBrowserSourceFile(null);
+    setBrowserCurrentUrl('');
   }, []);
   const handleBrowserClose = useCallback(() => {
     setBrowserUrl(null);
     setBrowserAlive(false);
     setBrowserSourceFile(null);
+    setBrowserCurrentUrl('');
     if (terminalPinned && terminalAlive) setSplitActiveView('terminal');
     else if (splitFile) setSplitActiveView('file');
   }, [terminalPinned, terminalAlive, splitFile]);
@@ -2716,6 +2736,7 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
               isLoading={isLoading}
               isSessionLoading={isSessionLoading}
               sessionId={sessionId}
+              isActive={isActive}
               virtuosoRef={virtuosoRef}
               onScrollerRef={attachScroller}
               followEnabledRef={followEnabledRef}
@@ -2858,6 +2879,7 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
               onFilePreviewExternal={isSplitViewEnabled && !isNarrowLayout ? handleSplitFilePreview : undefined}
               onOpenTerminal={isSplitViewEnabled && !isNarrowLayout ? handleOpenTerminal : undefined}
               terminalAlive={terminalAlive}
+              onOpenBrowser={isSplitViewEnabled && !isNarrowLayout ? handleOpenBrowser : undefined}
             />
           </div>
         </>
@@ -2959,7 +2981,19 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
                   >
                     <Globe className="h-3 w-3" />
                     <span className="max-w-[120px] truncate">
-                      {browserSourceFile ? browserSourceFile.name : (() => { try { return new URL(browserUrl).hostname; } catch { return '浏览器'; } })()}
+                      {browserSourceFile
+                        ? browserSourceFile.name
+                        : (() => {
+                            // Prefer the live URL surfaced from BrowserPanel — the
+                            // `browserUrl` prop is the seed only and stays at
+                            // BROWSER_BLANK_URL even after the user navigates.
+                            const liveUrl = browserCurrentUrl || browserUrl;
+                            try {
+                              return new URL(liveUrl).hostname || '新标签页';
+                            } catch {
+                              return '浏览器';
+                            }
+                          })()}
                     </span>
                     <span
                       role="button"
@@ -2968,6 +3002,7 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
                         setBrowserUrl(null);
                         setBrowserAlive(false);
                         setBrowserSourceFile(null);
+                        setBrowserCurrentUrl('');
                         if (terminalPinned && terminalAlive) setSplitActiveView('terminal');
                         else if (splitFile) setSplitActiveView('file');
                       }}
@@ -3083,6 +3118,7 @@ export default function Chat({ onBack, onNewSession, onSwitchSession, initialMes
                     onCreateFailed={handleBrowserCreateFailed}
                     onClose={handleBrowserClose}
                     onSwitchToEditor={handleBrowserSwitchToEditor}
+                    onUrlChange={handleBrowserUrlChange}
                   />
                 </Suspense>
               </div>

@@ -1,5 +1,5 @@
 import { Loader2 } from 'lucide-react';
-import React, { memo, useMemo, useState, useEffect, useLayoutEffect, useRef } from 'react';
+import React, { memo, useCallback, useMemo, useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { Virtuoso } from 'react-virtuoso';
 import type { VirtuosoHandle } from 'react-virtuoso';
 
@@ -25,6 +25,16 @@ interface MessageListProps {
   isLoading: boolean;
   isSessionLoading?: boolean;
   sessionId?: string | null;
+  /**
+   * Whether this Tab is currently visible. When `false`, the host wraps this
+   * subtree in `content-visibility: hidden`, which lets WebKit defer/skip
+   * descendant layout. Virtuoso's ResizeObserver can then fire with zero or
+   * stale geometry and erroneously emit `atBottomStateChange(false)` —
+   * corrupting the follow-state machine. We use this flag to (a) ignore
+   * those bogus measurements and (b) re-pin scroll to bottom on re-activation
+   * if we were following before the tab went hidden.
+   */
+  isActive?: boolean;
   // Pagination: Virtuoso maintains the visible scroll position across
   // prepended items by the absolute index of data[0]. Default 0 = no pagination.
   firstItemIndex?: number;
@@ -147,6 +157,7 @@ const MessageList = memo(function MessageList({
   isLoading,
   isSessionLoading,
   sessionId,
+  isActive = true,
   firstItemIndex,
   onLoadOlder,
   virtuosoRef,
@@ -223,6 +234,32 @@ const MessageList = memo(function MessageList({
     scrollToBottom('auto');
   }, [sessionId, allMessages.length, scrollToBottom]);
 
+  // Tab inactive → active recovery. While inactive, the host wraps us in
+  // content-visibility: hidden; Virtuoso's ResizeObserver may have fired with
+  // bogus geometry and shifted internal scroll/index state, even though we
+  // gate handleAtBottomChange below to keep followEnabledRef intact. On
+  // re-activation, if we were still in follow mode, re-pin to bottom so any
+  // drift from hidden-layout measurements is corrected before paint.
+  const wasInactiveRef = useRef(!isActive);
+  useLayoutEffect(() => {
+    const wasInactive = wasInactiveRef.current;
+    wasInactiveRef.current = !isActive;
+    if (!isActive || !wasInactive) return;
+    if (followEnabledRef.current === false) return;
+    if (allMessages.length === 0) return;
+    scrollToBottom('auto');
+  }, [isActive, allMessages.length, scrollToBottom, followEnabledRef]);
+
+  // Gate Virtuoso's atBottomStateChange while the tab is hidden.
+  // content-visibility: hidden lets WebKit deliver ResizeObserver callbacks
+  // with zero/stale dimensions, which would otherwise be interpreted as
+  // "user scrolled away" and flip followEnabledRef.current to false — losing
+  // bottom-pinning permanently for this stream.
+  const guardedAtBottomChange = useCallback((atBottom: boolean) => {
+    if (!isActive) return;
+    handleAtBottomChange(atBottom);
+  }, [isActive, handleAtBottomChange]);
+
   // ── Auto-scroll during streaming — throttled to ~20fps (48ms) ──
   // followOutput only fires on count change. During streaming the last message keeps
   // growing taller. autoscrollToBottom() handles this (scrolls only if already at bottom).
@@ -236,6 +273,10 @@ const MessageList = memo(function MessageList({
   const trailingScrollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (!streamingMessage || !followEnabledRef.current) return;
+    // Skip while hidden — autoscrollToBottom() against a content-visibility:
+    // hidden scroller can compute against stale geometry. The re-pin layout
+    // effect above restores position on re-activation.
+    if (!isActive) return;
 
     const THROTTLE_MS = 48; // ~20fps
     const now = performance.now();
@@ -266,7 +307,7 @@ const MessageList = memo(function MessageList({
       cancelAnimationFrame(scrollRafRef.current);
       if (trailingScrollRef.current) { clearTimeout(trailingScrollRef.current); trailingScrollRef.current = null; }
     };
-  }, [streamingMessage, followEnabledRef, virtuosoRef]);
+  }, [streamingMessage, isActive, followEnabledRef, virtuosoRef]);
 
   // ── Refs for stable callbacks — avoid recreating itemContent/Footer on every render ──
   const streamingMessageRef = useRef(streamingMessage);
@@ -391,7 +432,7 @@ const MessageList = memo(function MessageList({
         firstItemIndex={firstItemIndex}
         startReached={onLoadOlder}
         followOutput={handleFollowOutput}
-        atBottomStateChange={handleAtBottomChange}
+        atBottomStateChange={guardedAtBottomChange}
         atBottomThreshold={50}
         defaultItemHeight={480}
         increaseViewportBy={{ top: 800, bottom: 400 }}
