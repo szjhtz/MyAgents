@@ -11,21 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **定时任务 `permissionMode: "auto"` 在无人值守场景退化（v0.2.4 引入的回归）**：cron / task 上下文里 `'auto'` 曾被字面解释为 `acceptEdits`，导致 WebSearch / Bash / mcp__* 等工具在人审通道里超时被拒，AI 误以为执行成功。现在所有 runtime（builtin / Claude Code / Codex / Gemini）下，"用户没主动选" 一律映射到该 runtime 的最大权限；用户的具体选项（auto / plan / fullAgency 等）继续按字面尊重。桌面 chat tab 行为不变。
-- **删除定时任务后 `~/.myagents/cron_runs/<id>.jsonl` 残留**：删除流程现在会级联清理执行历史文件。
-- **`myagents task run` 报错指向 HTTP 路径**：现在错误提示指向 `myagents task rerun <id>` CLI 命令。
-- **`myagents cron start` 文档误导**："Trigger a task for immediate execution" 改为说明 `start` 仅恢复调度（不立即执行），新增 `run-now` 才是立即触发。
+- **定时任务无人值守时工具被拒挂超时（0.2.4 引入的回归）**：默认权限模式在 cron 里曾被当成"半允许"模式，结果 WebSearch / Bash / MCP 工具卡在人审通道直到超时，AI 写"工具被拒"还被记成成功。修复后未主动选权限的 cron 一律给最大权限，AI 选了什么就尊重什么。桌面对话不受影响。老配置首次启动会自动迁移一次。
+- **删除定时任务后执行历史文件残留**：删除时会把 `cron_runs/` 里对应的 jsonl 一并清掉。
+- **`myagents task run` 报错指向 HTTP 路径**：错误提示改为可直接复制的 `myagents task rerun <id>`。
+- **`myagents cron start` 文档误导**：以前文案写"立即执行"实际只是恢复调度。重写说明，并新增 `run-now` 才是真的立即触发。
 
 ### Added
 
-- **`myagents cron run-now <taskId>`**：新 CLI 命令，立即触发一次执行而不修改任务调度或状态；fire-and-forget，立即返回 `{ taskId, sessionId, dispatchedAt }`。任务正在执行时返回冲突。
-- **`POST /api/cron/trigger`**：对应的管理 API 端点。
-- **`myagents cron list` 信息增强**：新增 Next（下次触发时间）/ Last（上次执行 ✓✗ + 时间）/ Dur（上次耗时）/ Runs（总执行次数）四列；状态显示从 `Running`/`Stopped` 改为 `enabled`/`disabled`。底层枚举不变。
-- **`myagents cron runs --full`**：默认输出截断到 80 字符并去除换行避免列错位；`--full` 旗标输出完整内容。
-
-### Migration
-
-- **一次性迁移：`cron_tasks.json` 中 `permissionMode: "auto"` → `""`**：v0.2.5 之前 `'auto'` 是 cron 的隐式默认值（不是用户主动选），如不迁移会被新的解析器字面尊重为 acceptEdits → 仍会触发原回归。迁移幂等，统一日志可见 `Migrated N task(s): permissionMode='auto'`。如需主动设置 `'auto'`，可在迁移后通过 `myagents cron update <id> --permissionMode auto` 显式设置。
+- **`myagents cron run-now <id>`**：立即跑一次而不动调度 / 状态。CLI 立即返回，会话 ID 一并打出来好查。任务正在执行时拒绝重叠。
+- **`cron list` 多了几列实用信息**：下次触发时间、上次成败 ✓✗、上次耗时、总执行次数。状态从 `Running`/`Stopped` 改成更清晰的 `enabled`/`disabled`。
+- **`cron runs` 默认折行截断 + `--full` 旗标**：长输出不再撑乱表格；要看全文加 `--full`。
 
 ---
 

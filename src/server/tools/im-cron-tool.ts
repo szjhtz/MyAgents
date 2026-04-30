@@ -236,10 +236,14 @@ async function imCronToolHandler(args: {
           sessionTarget: args.job.sessionTarget ?? 'new_session',
           workspacePath: addCtx.workspacePath,
           model: addCtx.model,
-          // PRD 0.2.5 R2/R3: empty string = sentinel for "user didn't pick →
-          // use runtime max permission". Don't auto-fill 'auto' (would be
-          // respected literally as acceptEdits and break unattended runs).
-          permissionMode: addCtx.permissionMode ?? '',
+          // PRD 0.2.5 R2 — cron creation context never inherits the calling
+          // session's permission. The chat tab's interactive default
+          // ('auto' = acceptEdits) is semantically wrong for unattended
+          // execution. Empty string is the sentinel for "use runtime max"
+          // resolved by Node `resolveCronPermissionMode` at execute time.
+          // Tool schema doesn't expose permission to the AI; if a deliberate
+          // override is needed, add it to the `job` schema.
+          permissionMode: '',
           providerEnv: addCtx.providerEnv,
           runtime: addCtx.runtime,
           runtimeConfig: addCtx.runtimeConfig,

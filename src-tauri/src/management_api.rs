@@ -279,7 +279,11 @@ async fn create_cron_handler(
         run_mode,
         notify_enabled: true,
         tab_id: None,
-        permission_mode: req.permission_mode.unwrap_or_else(|| "auto".to_string()),
+        // PRD 0.2.5 R2/R3 — empty string is the sentinel for "user didn't pick →
+        // resolve to runtime max at execute time". Pre-v0.2.5 this field
+        // silently defaulted to "auto", which the cron resolver respects
+        // literally as acceptEdits and breaks unattended runs.
+        permission_mode: req.permission_mode.unwrap_or_default(),
         model: req.model,
         provider_env: req.provider_env,
         runtime: req.runtime,
@@ -1631,14 +1635,16 @@ async fn ensure_cron_for_task(ta: &task::Task) -> Result<String, String> {
         .map(cron_task::EndConditions::from)
         .unwrap_or_default();
     let desired_model = ta.model.clone();
-    // PRD 0.2.4 §需求 4 (4b): unset = runtime maximum permission, NOT
-    // "auto". Unattended task dispatch would otherwise block on the
-    // first tool call. The cron exec path translates `fullAgency` into
-    // the runtime-specific bypass mode.
+    // PRD 0.2.5 R2 — unset = empty sentinel; the cron exec path (Node
+    // resolveCronPermissionMode) maps that to the runtime-specific MAX
+    // mode (builtin: fullAgency, cc: bypassPermissions, codex:
+    // no-restrictions, gemini: yolo). Hardcoding "fullAgency" here was
+    // wrong for Codex/Gemini — those runtimes don't recognize
+    // "fullAgency" and fell through to interactive defaults.
     let desired_permission_mode = ta
         .permission_mode
         .clone()
-        .unwrap_or_else(|| "fullAgency".to_string());
+        .unwrap_or_default();
 
     // Candidate IDs: the Task's own cached `cron_task_id`, and any other
     // CronTask that carries this Task's id as a back-pointer (defensive —
