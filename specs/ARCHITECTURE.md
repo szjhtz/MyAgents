@@ -589,7 +589,7 @@ installer.ts         — 扫描 SKILL.md / marketplace.json → InstallAnalysis
 
 | 二进制 | 用途 | 来源 | 打包位置 |
 |--------|------|------|---------|
-| **cuse** | 预置 Computer-Use MCP（截图/点击/输入/滚动，仅 macOS/Windows） | `hAcKlyc/MyAgents-Cuse` GitHub Release | `src-tauri/binaries/cuse-*-<triple>[.exe]` |
+| **cuse** | 预置 Computer-Use MCP（截图/点击/输入/滚动，仅 macOS/Windows） | Cloudflare R2: `https://download.myagents.io/cuse/...`（源头是私有 `hAcKlyc/MyAgents-Cuse` GH Release，由该仓库的 `publish_r2.sh` 镜像到 R2 供本开源 repo build 使用） | `src-tauri/binaries/cuse-*-<triple>[.exe]` |
 
 新增同类二进制约定：
 - 注册到 `PRESET_MCP_SERVERS` 时用 `command: '__bundled_xxx__'` 哨兵
