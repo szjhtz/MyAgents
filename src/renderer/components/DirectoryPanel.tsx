@@ -1925,7 +1925,7 @@ const DirectoryPanel = memo(
                             void handlePreview(data);
                           } else {
                             toast.info(
-                              "暂不支持预览此文件类型，可右键进入文件夹打开",
+                              "暂不支持预览此文件类型，可右键菜单打开",
                             );
                           }
                         };
