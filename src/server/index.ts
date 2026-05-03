@@ -588,7 +588,7 @@ function resolveBundledSkillsDir(): string | null {
 const SYSTEM_SKILLS: readonly string[] = [
   'task-alignment',
   'task-implement',
-  'ultra-research',
+  // v10: ultra-research removed — not generic enough.
   'download-anything',
   // v8: see commands.rs::SYSTEM_SKILLS — agent-browser promoted to system
   // skill so existing users get the updated self-install SKILL.md after

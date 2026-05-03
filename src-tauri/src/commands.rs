@@ -900,7 +900,7 @@ pub fn cmd_copy_folder_to_templates(
 
 // ============= Admin Agent Sync =============
 
-const ADMIN_AGENT_VERSION: &str = "14";
+const ADMIN_AGENT_VERSION: &str = "16";
 
 /// Merge bundled admin agent files into ~/.myagents/
 /// Version-gated: only runs when ADMIN_AGENT_VERSION changes.
@@ -1095,7 +1095,7 @@ pub fn cmd_sync_cli<R: Runtime>(
 // matching exclusion list in src/server/index.ts::seedBundledSkills
 // MUST be kept in sync (comment there points back here).
 
-const SYSTEM_SKILLS_VERSION: &str = "8";
+const SYSTEM_SKILLS_VERSION: &str = "10";
 
 /// Skills that ship with the app and MUST stay at the bundled version —
 /// the app's flows depend on them, users are not meant to customise.
@@ -1103,7 +1103,9 @@ const SYSTEM_SKILLS_VERSION: &str = "8";
 const SYSTEM_SKILLS: &[&str] = &[
     "task-alignment",
     "task-implement",
-    "ultra-research",
+    // v10: ultra-research removed — not generic enough to ship as system
+    // skill. Existing installs retain the dir at ~/.myagents/skills/
+    // ultra-research/ until the user deletes it (no orphan cleanup logic).
     "download-anything",
     // v8: agent-browser promoted from utility → system skill. The CLI is
     // no longer bundled with the app; the SKILL.md teaches AI to self-install
@@ -1111,6 +1113,14 @@ const SYSTEM_SKILLS: &[&str] = &[
     // need the updated SKILL.md to land or their AI will hit `command not
     // found` after upgrading. System-skill status forces the overwrite.
     "agent-browser",
+    // v9: myagents-cli promoted from helper-bundled skill (was at
+    // bundled-agents/myagents_helper/.claude/skills/self-config/) to a
+    // global system skill. Every AI session inside MyAgents — Chat / IM Bot
+    // / Cron / Helper — should be able to drive the product's own
+    // capabilities (cron, task center, MCP, Provider, channels, plugins,
+    // skills, widgets) through the CLI. SKILL.md changes track CLI surface
+    // changes, so it must force-overwrite on version bumps.
+    "myagents-cli",
 ];
 
 /// Skills unavailable on certain platforms due to upstream bugs.
