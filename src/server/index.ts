@@ -409,6 +409,15 @@ type CronExecutePayload = {
     upstreamFormat?: 'chat_completions' | 'responses';
   };
   /**
+   * PRD #119: explicit routing intent. Controls how the handler resolves
+   * effective model + providerEnv:
+   *   - `'followAgent'` (default if absent) — snapshot-based, follows agent
+   *   - `'subscription'` — force `effectiveProviderEnv = undefined`
+   *   - `'explicit'`     — force `effectiveProviderEnv = payload.providerEnv`
+   * Mirrors Rust's `cron_task::ProviderIntent`.
+   */
+  providerIntent?: 'followAgent' | 'subscription' | 'explicit';
+  /**
    * Per-task MCP enable list override (PRD 0.2.4 §需求 4).
    * `undefined` = follow workspace MCP (`config.agents[].mcpEnabledServers`).
    * `[id, id, ...]` = enable only these MCP server ids for this task.
@@ -2058,42 +2067,58 @@ async function main() {
           // Wrap cron prompt so AI recognizes it as system-triggered (not a real-time human message)
           const wrappedPrompt = `<system-reminder>\n<CRON_TASK>\n${prompt}\n</CRON_TASK>\n</system-reminder>`;
 
-          // v0.1.69 T15: Resolve per-tick from the session snapshot (owned kind).
-          // This endpoint runs against whatever session is already loaded in this
-          // Sidecar, so there's no switch step — but the snapshot is still
-          // authoritative over task-frozen payload fields.
+          // PRD #119: intent-driven resolution — see /cron/execute-sync for
+          // the full design comment. This endpoint runs against whatever
+          // session is already loaded (no session switch), so the snapshot
+          // path operates on the current session's metadata. For Subscription
+          // / Explicit intents we bypass the snapshot entirely and use the
+          // payload's values directly.
+          const intent = payload.providerIntent ?? 'followAgent';
           let effectiveModel = model;
           let effectiveProviderEnv: typeof providerEnv = providerEnv;
           let effectiveRuntimeConfig = payload.runtimeConfig;
-          if (currentSessionId) {
-            const sessionMeta = getSessionMetadata(currentSessionId);
-            const agent = findAgentByWorkspacePath(agentDir) as AgentConfig | undefined;
-            if (sessionMeta && agent) {
-              const resolved = resolveSessionConfig(sessionMeta, agent, undefined, 'owned');
-              if (resolved.model !== undefined) effectiveModel = resolved.model;
-              if (resolved.providerEnvJson) {
-                try {
-                  effectiveProviderEnv = JSON.parse(resolved.providerEnvJson);
-                } catch (e) {
-                  console.warn(`[cron] execute T15: failed to parse providerEnvJson for session ${currentSessionId}, falling back to task-frozen value`, e);
+
+          if (intent === 'followAgent') {
+            if (currentSessionId) {
+              const sessionMeta = getSessionMetadata(currentSessionId);
+              const agent = findAgentByWorkspacePath(agentDir) as AgentConfig | undefined;
+              if (sessionMeta && agent) {
+                const resolved = resolveSessionConfig(sessionMeta, agent, undefined, 'owned');
+                if (resolved.model !== undefined) effectiveModel = resolved.model;
+                if (resolved.providerEnvJson) {
+                  try {
+                    effectiveProviderEnv = JSON.parse(resolved.providerEnvJson);
+                  } catch (e) {
+                    console.warn(`[cron] execute followAgent: failed to parse providerEnvJson for session ${currentSessionId}, falling back to task-frozen value`, e);
+                  }
+                }
+                if (resolved.runtime !== 'builtin') {
+                  effectiveRuntimeConfig = {
+                    ...(payload.runtimeConfig ?? {}),
+                    model: resolved.model ?? payload.runtimeConfig?.model,
+                    permissionMode: resolved.permissionMode ?? payload.runtimeConfig?.permissionMode,
+                  };
                 }
               }
-              if (resolved.runtime !== 'builtin') {
-                effectiveRuntimeConfig = {
-                  ...(payload.runtimeConfig ?? {}),
-                  model: resolved.model ?? payload.runtimeConfig?.model,
-                  permissionMode: resolved.permissionMode ?? payload.runtimeConfig?.permissionMode,
-                };
-              }
+            }
+          } else if (intent === 'subscription') {
+            effectiveProviderEnv = undefined;
+            if (payload.model) effectiveModel = payload.model;
+            if (effectiveRuntimeConfig) {
+              effectiveRuntimeConfig = { ...effectiveRuntimeConfig, model: payload.model ?? effectiveRuntimeConfig.model };
+            }
+          } else if (intent === 'explicit') {
+            if (payload.providerEnv) {
+              effectiveProviderEnv = payload.providerEnv;
+            } else {
+              console.warn(`[cron] execute intent=explicit but payload.providerEnv is missing — degrading to subscription`);
+              effectiveProviderEnv = undefined;
+            }
+            if (payload.model) effectiveModel = payload.model;
+            if (effectiveRuntimeConfig) {
+              effectiveRuntimeConfig = { ...effectiveRuntimeConfig, model: payload.model ?? effectiveRuntimeConfig.model };
             }
           }
-          // Issue #119: task-level model + providerEnv are an atomic routing bundle and
-          // must override snapshot together. Without re-applying payload.providerEnv after
-          // the snapshot resolve, model=task + endpoint=agent-snapshot mismatch produces
-          // upstream 400 + silent empty output. Mirrors the precedence applied in
-          // /cron/execute-sync below.
-          if (payload.model) effectiveModel = payload.model;
-          if (payload.providerEnv) effectiveProviderEnv = payload.providerEnv;
 
           // Cron tasks are unattended — "user didn't pick" must map to the
           // runtime's MAX permission (not its interactive default), or
@@ -2185,6 +2210,24 @@ async function main() {
           // owner kind in resolveSessionConfig (PRD D4 footnote).
           const cronAgent = findAgentByWorkspacePath(agentDir) as AgentConfig | undefined;
           const cronSnapshot: Partial<SessionMetadata> = cronAgent ? snapshotForOwnedSession(cronAgent) : {};
+          // PRD #119: stamp the cron's explicit routing intent into the
+          // freshly-built snapshot. For Subscription / Explicit intents,
+          // the snapshot reflects the cron's own provider — NOT the agent's
+          // — so other readers (session details panel, history view) see
+          // an accurate record of what config the run actually used. This
+          // also lets the unified `resolveSessionConfig` path read back the
+          // right values without intent-aware branching at read time.
+          const cronIntent = payload.providerIntent ?? 'followAgent';
+          if (cronIntent === 'subscription') {
+            cronSnapshot.providerId = undefined;
+            cronSnapshot.providerEnvJson = undefined;
+            if (payload.model) cronSnapshot.model = payload.model;
+          } else if (cronIntent === 'explicit' && payload.providerEnv) {
+            cronSnapshot.providerId = undefined;
+            cronSnapshot.providerEnvJson = JSON.stringify(payload.providerEnv);
+            if (payload.model) cronSnapshot.model = payload.model;
+          }
+          // FollowAgent (legacy): cronSnapshot keeps the agent's values verbatim.
           const overrideRuntime = payload.runtime ?? getActiveRuntimeType();
           if (overrideRuntime) cronSnapshot.runtime = overrideRuntime;
           // PRD 0.2.4 §需求 4 — stamp per-task MCP override into the new
@@ -2240,78 +2283,94 @@ async function main() {
           console.log(`[cron] execute-sync taskId=${taskId} no sessionId provided, using current session`);
         }
 
-        // v0.1.69 T15: Cron per-tick resolve — unified for both run modes.
+        // ── Intent-driven resolution (PRD #119, 2026-05) ──────────────────
         //
-        // Both single_session and new_session derive their effective config from the
-        // session snapshot that was captured at creation time (single_session: at
-        // CronTask creation; new_session: at each tick by `snapshotForOwnedSession`
-        // above). CronTask.model / provider_env / runtime_config are task-frozen
-        // fallbacks used only if no snapshot exists.
+        // Cron tasks declare their routing intent explicitly. Three branches:
         //
-        // Resolving for both paths keeps "payload.model" from winning over the fresh
-        // per-tick snapshot in new_session mode — if the user edits the Agent between
-        // ticks, new_session picks up the change next tick via the fresh snapshot.
+        //   - `subscription` — cron uses Anthropic subscription regardless of
+        //     what the agent currently looks like. effectiveProviderEnv is
+        //     forced to undefined; agent's third-party `providerEnvJson` is
+        //     IGNORED. effectiveModel comes from payload.
+        //
+        //   - `explicit`     — cron uses its own captured providerEnv. Snapshot
+        //     is bypassed entirely. effectiveModel + effectiveProviderEnv come
+        //     from payload, atomic. (Pre-#119 the handler re-resolved from the
+        //     agent snapshot, which silently overwrote providerEnv with the
+        //     agent's even though model came from the cron — model+endpoint
+        //     mismatch → 400 + silent empty output.)
+        //
+        //   - `followAgent`  — pre-#119 default. Read the session snapshot,
+        //     fall back to agent for unset fields. Behavior preserved for
+        //     legacy crons (those persisted before #119 deserialize as
+        //     `followAgent` via serde default).
+        //
+        // The snapshot itself was already updated above for new_session mode
+        // to match intent, so a future read still returns coherent values —
+        // but we don't rely on that here; we drive directly from intent +
+        // payload so single_session and new_session behave identically.
+        //
+        // permissionMode override is intent-independent: it overrides the
+        // resolved value if payload.permissionMode is set, else falls back
+        // to the resolver / runtime default.
+        const intent = payload.providerIntent ?? 'followAgent';
+
         let effectiveModel = model;
         let effectiveProviderEnv: typeof providerEnv = providerEnv;
         let effectiveRuntimeConfig = payload.runtimeConfig;
-        const snapshotSessionId = effectiveSessionId ?? getSessionId();
-        if (snapshotSessionId) {
-          const sessionMeta = getSessionMetadata(snapshotSessionId);
-          const agent = findAgentByWorkspacePath(agentDir) as AgentConfig | undefined;
-          if (sessionMeta && agent) {
-            const resolved = resolveSessionConfig(sessionMeta, agent, undefined, 'owned');
-            if (resolved.model !== undefined) effectiveModel = resolved.model;
-            if (resolved.providerEnvJson) {
-              try {
-                effectiveProviderEnv = JSON.parse(resolved.providerEnvJson);
-              } catch (e) {
-                console.warn(`[cron] execute-sync T15: failed to parse providerEnvJson for session ${snapshotSessionId}, falling back to task-frozen value`, e);
+
+        if (intent === 'followAgent') {
+          // Legacy snapshot-based resolution.
+          const snapshotSessionId = effectiveSessionId ?? getSessionId();
+          if (snapshotSessionId) {
+            const sessionMeta = getSessionMetadata(snapshotSessionId);
+            const agent = findAgentByWorkspacePath(agentDir) as AgentConfig | undefined;
+            if (sessionMeta && agent) {
+              const resolved = resolveSessionConfig(sessionMeta, agent, undefined, 'owned');
+              if (resolved.model !== undefined) effectiveModel = resolved.model;
+              if (resolved.providerEnvJson) {
+                try {
+                  effectiveProviderEnv = JSON.parse(resolved.providerEnvJson);
+                } catch (e) {
+                  console.warn(`[cron] execute-sync followAgent: failed to parse providerEnvJson for session ${snapshotSessionId}, falling back to task-frozen value`, e);
+                }
               }
+              if (resolved.runtime !== 'builtin') {
+                effectiveRuntimeConfig = {
+                  ...(payload.runtimeConfig ?? {}),
+                  model: resolved.model ?? payload.runtimeConfig?.model,
+                  permissionMode: resolved.permissionMode ?? payload.runtimeConfig?.permissionMode,
+                };
+              }
+              console.log(`[cron] execute-sync intent=followAgent session=${snapshotSessionId} runMode=${effectiveRunMode} snapshotLocked=${Boolean(sessionMeta.configSnapshotAt)} model=${effectiveModel ?? 'default'} runtime=${resolved.runtime}`);
             }
-            if (resolved.runtime !== 'builtin') {
-              effectiveRuntimeConfig = {
-                ...(payload.runtimeConfig ?? {}),
-                model: resolved.model ?? payload.runtimeConfig?.model,
-                permissionMode: resolved.permissionMode ?? payload.runtimeConfig?.permissionMode,
-              };
-            }
-            console.log(`[cron] execute-sync T15: resolved from snapshot session=${snapshotSessionId} runMode=${effectiveRunMode} snapshotLocked=${Boolean(sessionMeta.configSnapshotAt)} model=${effectiveModel ?? 'default'} runtime=${resolved.runtime}`);
           }
+        } else if (intent === 'subscription') {
+          // Cron explicitly wants subscription — never inherit from agent.
+          effectiveProviderEnv = undefined;
+          if (payload.model) effectiveModel = payload.model;
+          if (effectiveRuntimeConfig) {
+            effectiveRuntimeConfig = { ...effectiveRuntimeConfig, model: payload.model ?? effectiveRuntimeConfig.model };
+          }
+          console.log(`[cron] execute-sync intent=subscription runMode=${effectiveRunMode} model=${effectiveModel ?? 'default'} (snapshot bypassed)`);
+        } else if (intent === 'explicit') {
+          // Cron explicitly wants its captured provider — never inherit from agent.
+          // payload.providerEnv MUST be present for this intent to be meaningful;
+          // if it's missing (malformed task), defensively degrade to subscription
+          // rather than letting the snapshot resolver fill in an unrelated provider.
+          if (payload.providerEnv) {
+            effectiveProviderEnv = payload.providerEnv;
+          } else {
+            console.warn(`[cron] execute-sync intent=explicit but payload.providerEnv is missing — degrading to subscription to avoid misrouting`);
+            effectiveProviderEnv = undefined;
+          }
+          if (payload.model) effectiveModel = payload.model;
+          if (effectiveRuntimeConfig) {
+            effectiveRuntimeConfig = { ...effectiveRuntimeConfig, model: payload.model ?? effectiveRuntimeConfig.model };
+          }
+          console.log(`[cron] execute-sync intent=explicit runMode=${effectiveRunMode} model=${effectiveModel ?? 'default'} provider=${effectiveProviderEnv?.baseUrl ?? 'subscription-fallback'}`);
         }
 
-        // Per-task override precedence (v0.1.69 cross-review fix):
-        //
-        // Task-level `model` / `permissionMode` / `providerEnv` set at task creation time
-        // (via CLI `--model` / `--permissionMode` flags on `task create-direct` /
-        // `task create-from-alignment`, or via the cron-create UI) are explicit per-task
-        // intent — the user said "this task should run with this model/provider regardless
-        // of what the session/agent defaults are". They must therefore win over both
-        // (a) the agent default copied into a fresh new_session snapshot, and
-        // (b) the historical session snapshot reused by single_session mode.
-        //
-        // We apply on top of `effectiveModel` / `effectiveProviderEnv` / `effectiveRuntimeConfig`
-        // rather than injecting into the snapshot, so the behavior is identical for both run
-        // modes and the snapshot itself stays a pure derivation of session history.
-        //
-        // Without this block, the CLI surface / cron UI accept and validate overrides,
-        // `enrichTaskCreateResponse` echoes them back as "overridden" — but dispatch
-        // silently falls back to the snapshot value. That's the silent-data-loss bug
-        // cross-review flagged on 2026-04-22.
-        //
-        // #119 (2026-05): the same silent-loss applied to `providerEnv` — the cron carried
-        // its own DeepSeek providerEnv but ran against an Agent configured for MIMO.
-        // Snapshot resolve overwrote `effectiveProviderEnv` with MIMO; only `payload.model`
-        // was reapplied below, leaving model=DeepSeek + endpoint=MIMO → 400 + silent empty
-        // output. Provider and model are an atomic routing bundle and must override together.
-        if (payload.model) {
-          effectiveModel = payload.model;
-          if (effectiveRuntimeConfig) {
-            effectiveRuntimeConfig = { ...effectiveRuntimeConfig, model: payload.model };
-          }
-        }
-        if (payload.providerEnv) {
-          effectiveProviderEnv = payload.providerEnv;
-        }
+        // Permission mode override is intent-independent.
         if (payload.permissionMode) {
           effectiveRuntimeConfig = {
             ...(effectiveRuntimeConfig ?? {}),
