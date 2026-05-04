@@ -680,7 +680,13 @@ function ModelPicker(props: {
   const variant: 'builtin' | 'external' = isBuiltin ? 'builtin' : 'external';
   const isOpen = open === variant;
 
-  // Closed-button label.
+  // Closed-button label. PRD 0.2.9 — "跟随 Agent" is a real selected state
+  // (not a placeholder), so render it in `text-[var(--ink)]` to match the
+  // Runtime / 权限模式 selects above. CustomSelect treats the empty-string
+  // value as a selected option (FOLLOW_VALUE) and gets ink color via its
+  // `selectedOption ? text-[var(--ink)] : text-[var(--ink-muted)]` branch
+  // (CustomSelect.tsx:94); we mirror that here so the three 高级配置
+  // fields read as a uniform group.
   let closedLabel: React.ReactNode;
   if (isBuiltin) {
     if (providerId && model) {
@@ -701,7 +707,7 @@ function ModelPicker(props: {
       );
     } else {
       closedLabel = (
-        <span className="truncate text-[var(--ink-muted)]">
+        <span className="truncate">
           {workspaceDefaultModelLabel
             ? `跟随 Agent（当前 ${workspaceDefaultModelLabel}）`
             : '跟随 Agent 工作区'}
@@ -718,7 +724,7 @@ function ModelPicker(props: {
       );
     } else {
       closedLabel = (
-        <span className="truncate text-[var(--ink-muted)]">跟随 Agent 当前模型</span>
+        <span className="truncate">跟随 Agent 当前模型</span>
       );
     }
   }
@@ -757,7 +763,7 @@ function ModelPicker(props: {
               <>
                 <button
                   type="button"
-                  className={`flex w-full items-center rounded-[var(--radius-sm)] px-3 py-1.5 text-left text-[13px] transition-colors ${
+                  className={`flex w-full items-center rounded-[var(--radius-sm)] px-3 py-1.5 text-left text-sm transition-colors ${
                     !providerId
                       ? 'bg-[var(--accent-warm-muted)] text-[var(--accent-warm)]'
                       : 'text-[var(--ink)] hover:bg-[var(--hover-bg)]'
@@ -782,7 +788,7 @@ function ModelPicker(props: {
                         <button
                           type="button"
                           key={`${p.id}:${m.model}`}
-                          className={`flex w-full items-center rounded-[var(--radius-sm)] px-3 py-1.5 text-left text-[13px] transition-colors ${
+                          className={`flex w-full items-center rounded-[var(--radius-sm)] px-3 py-1.5 text-left text-sm transition-colors ${
                             providerId === p.id && model === m.model
                               ? 'bg-[var(--accent-warm-muted)] text-[var(--accent-warm)]'
                               : 'text-[var(--ink)] hover:bg-[var(--hover-bg)]'
@@ -826,7 +832,7 @@ function ModelPicker(props: {
               <>
                 <button
                   type="button"
-                  className={`flex w-full items-center rounded-[var(--radius-sm)] px-3 py-1.5 text-left text-[13px] transition-colors ${
+                  className={`flex w-full items-center rounded-[var(--radius-sm)] px-3 py-1.5 text-left text-sm transition-colors ${
                     !externalSelectedModel
                       ? 'bg-[var(--accent-warm-muted)] text-[var(--accent-warm)]'
                       : 'text-[var(--ink)] hover:bg-[var(--hover-bg)]'
@@ -846,7 +852,7 @@ function ModelPicker(props: {
                     <button
                       type="button"
                       key={m.value}
-                      className={`flex w-full items-center rounded-[var(--radius-sm)] px-3 py-1.5 text-left text-[13px] transition-colors ${
+                      className={`flex w-full items-center rounded-[var(--radius-sm)] px-3 py-1.5 text-left text-sm transition-colors ${
                         externalSelectedModel === m.value
                           ? 'bg-[var(--accent-warm-muted)] text-[var(--accent-warm)]'
                           : 'text-[var(--ink)] hover:bg-[var(--hover-bg)]'
