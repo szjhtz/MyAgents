@@ -6495,20 +6495,75 @@ async function startStreamingSession(preWarm = false): Promise<void> {
 
     // Fork detection: if this session was created via fork, override resume/sessionId
     // to use SDK's forkSession option (load source history + branch to new session).
-    // Consumed once — forkFrom is cleared from metadata after use.
+    //
+    // PRD #134/#135 — `forkFrom` is retained across restarts until the SDK
+    // has demonstrably persisted the forked conversation to its on-disk
+    // store (`~/.claude/projects/.../<sessionId>.jsonl`). The persistence
+    // probe (`sdkGetSessionMessages(sdkSid)` after first non-error result —
+    // see the result-message handler below) is what clears `forkFrom`,
+    // *not* this start path.
+    //
+    // The original code deleted `forkFrom` HERE on the very first start,
+    // before any SDK interaction. Two failure windows opened up:
+    //  (a) User idle after fork → model switch → restart with no message
+    //      ever sent → SDK never persisted → resume fails.
+    //  (b) User sends message + switches model → first turn runs but
+    //      SDK's JSONL flush is async; `setSessionModel`'s deferred
+    //      restart fires on the same `result` message and races with
+    //      the flush. Subprocess B's resume fails with "No conversation
+    //      found" → `recoverFromStaleSession()` silently spawns a fresh
+    //      SDK conversation → all forked context lost (#135 reports 40+
+    //      failed turns in a single day before this fix).
+    //
+    // Keeping `forkFrom` lets every pre-flush restart re-run fork mode.
+    // Re-forking is idempotent: SDK reloads the source history and writes
+    // to the same new sessionId. Cost = a few hundred ms of source-history
+    // reload per pre-flush restart. Acceptable vs. silent context loss.
     let forkMode = false;
     let forkResumeAt: string | undefined;
     const forkMeta = getSessionMetadata(sessionId);
     if (forkMeta?.forkFrom) {
-      const { sourceSessionId, messageUuid } = forkMeta.forkFrom;
-      console.log(`[agent] fork mode: resuming from ${sourceSessionId}, fork at ${messageUuid}, new session ${sessionId}`);
-      resumeFrom = sourceSessionId;
-      effectiveSdkSessionId = sessionId;
-      forkMode = true;
-      forkResumeAt = messageUuid;
-      // Clear forkFrom so subsequent restarts resume normally
-      delete forkMeta.forkFrom;
-      await saveSessionMetadata(forkMeta);
+      // PRD #134/#135 sync guard — before re-engaging fork mode, probe the
+      // SDK's own store for `sessionId`. If the JSONL already exists with
+      // ≥1 message, SDK has fully persisted: re-running fork mode here
+      // would make the SDK reject with `Session ID <X> is already in use`
+      // (empirically verified — the SDK CLI exits 1 with that exact stderr,
+      // see `test_fork_idempotency.mjs`). The existing
+      // `detectedAlreadyInUse` recovery only fires when `!sessionRegistered`,
+      // so this case would propagate as an unhandled error to the user.
+      // Skip fork mode + clear `forkFrom` so the caller uses normal resume.
+      //
+      // Why this is sync (await) rather than the post-result async probe:
+      // we MUST decide between fork-mode and normal-resume BEFORE issuing
+      // the SDK query, and we have to know definitively. The probe is a
+      // single file read (~ms) and only runs when forkFrom is set, so the
+      // cost is negligible.
+      const sdkSidProbe = forkMeta.sdkSessionId ?? sessionId;
+      let alreadyPersisted = false;
+      try {
+        const probe = await sdkGetSessionMessages(sdkSidProbe, {
+          dir: agentDir,
+          limit: 1,
+        });
+        if (probe.length > 0) alreadyPersisted = true;
+      } catch {
+        /* ENOENT / read error — treat as "not persisted" */
+      }
+
+      if (alreadyPersisted) {
+        console.log(`[agent] fork session ${sessionId} already persisted in SDK store — skipping fork mode, clearing forkFrom`);
+        delete forkMeta.forkFrom;
+        await saveSessionMetadata(forkMeta);
+        // Fall through: normal resume path picks up sdkSessionId via the
+        // sessionRegistered branch above.
+      } else {
+        const { sourceSessionId, messageUuid } = forkMeta.forkFrom;
+        console.log(`[agent] fork mode: resuming from ${sourceSessionId}, fork at ${messageUuid}, new session ${sessionId}`);
+        resumeFrom = sourceSessionId;
+        effectiveSdkSessionId = sessionId;
+        forkMode = true;
+        forkResumeAt = messageUuid;
+      }
     }
 
     const mcpStatus = currentMcpServers === null ? 'auto' : currentMcpServers.length === 0 ? 'disabled' : `enabled(${currentMcpServers.length})`;
@@ -7882,6 +7937,53 @@ async function startStreamingSession(preWarm = false): Promise<void> {
         });
 
         handleMessageComplete();
+
+        // PRD #134 — clear `forkFrom` only once we've VERIFIED the SDK has
+        // persisted the forked conversation to its on-disk store. "First
+        // non-error result" is necessary but not sufficient: the SDK's
+        // JSONL flush is async, and the deferred-restart abort triggered
+        // by `setSessionModel` (model-window restart) can fire on the
+        // same `result` message and race with the flush. If we cleared
+        // `forkFrom` here speculatively, the next subprocess would
+        // resume by sdkSessionId, fail with "No conversation found",
+        // and `recoverFromStaleSession()` would silently spawn a fresh
+        // SDK conversation — exactly the user-visible bug from #134/#135
+        // (40+ failed turns reported in a single day).
+        //
+        // Probe via `sdkGetSessionMessages(sdkSid)` — reads the SDK's
+        // own project JSONL. If it returns at least one message, the
+        // conversation is durably persisted and any future restart can
+        // resume normally. If it throws / returns empty, keep
+        // `forkFrom` so the next `startStreamingSession` re-runs fork
+        // mode (idempotent — SDK reloads source history and writes to
+        // the same new sessionId). Async — the result handler doesn't
+        // block on this.
+        if (!resultMessage.is_error) {
+          const meta = getSessionMetadata(sessionId);
+          const sdkSid = meta?.sdkSessionId;
+          const probeDir = agentDir;
+          if (meta?.forkFrom && sdkSid) {
+            sdkGetSessionMessages(sdkSid, { dir: probeDir, limit: 1 })
+              .then(found => {
+                if (found.length === 0) return; // not persisted yet — keep forkFrom
+                // Re-fetch metadata in case anything changed since the
+                // result handler captured it (e.g., restart already
+                // re-issued fork mode in the gap).
+                const fresh = getSessionMetadata(sessionId);
+                if (!fresh?.forkFrom) return;
+                console.log(`[agent] fork session ${sessionId} persisted in SDK store — clearing forkFrom`);
+                delete fresh.forkFrom;
+                saveSessionMetadata(fresh).catch(e =>
+                  console.warn('[agent] forkFrom clear failed (non-fatal, will retry on next turn):', e),
+                );
+              })
+              .catch(e => {
+                // ENOENT / "No conversation found" / etc. — SDK hasn't
+                // persisted yet. forkFrom stays; next start re-forks.
+                console.log(`[agent] forkFrom persistence probe inconclusive, keeping flag: ${(e as Error)?.message ?? e}`);
+              });
+          }
+        }
 
         // Post-turn error recovery. Three policies based on scenario × reason:
         //
