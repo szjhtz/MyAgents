@@ -2502,6 +2502,11 @@ async function handleAskUserQuestion(
       if (pendingAskUserQuestions.has(requestId)) {
         cleanup();
         console.warn('[AskUserQuestion] Timed out after 10 minutes');
+        // PRD #131 — broadcast lifecycle expiry so the frontend modal
+        // gets cleared. Without this, the user could still click Submit
+        // / Cancel after timeout, hitting the "Unknown request" path on
+        // the backend (issue #131 Bug 3 desync).
+        broadcast('ask-user-question:expired', { requestId, reason: 'timeout' });
         resolve(null);
       }
     }, 10 * 60 * 1000);
@@ -2514,7 +2519,18 @@ async function handleAskUserQuestion(
 
     const onAbort = () => {
       console.debug('[AskUserQuestion] Aborted by SDK signal');
+      // PRD #131 — guard the broadcast: the abort listener is left
+      // registered after handleAskUserQuestionResponse returns (no
+      // removeEventListener on the response path), and SDK's deny+interrupt
+      // fires the same canUseTool signal AFTER the user already
+      // responded. Without the guard the resulting `:expired` broadcast
+      // would clear a card the frontend was still rendering with the
+      // "submitted" state. Only broadcast when the entry is still pending.
+      const wasPending = pendingAskUserQuestions.has(requestId);
       cleanup();
+      if (wasPending) {
+        broadcast('ask-user-question:expired', { requestId, reason: 'aborted' });
+      }
       // Reject with AbortError so SDK's own abort handling creates the single tool_result.
       // Previously resolve(null) caused canUseTool to return deny → duplicate tool_result
       // (one from our deny, one from SDK's internal abort) → "tool_use ids must be unique" on resume.
@@ -2587,6 +2603,8 @@ async function handleExitPlanMode(
       if (pendingExitPlanMode.has(requestId)) {
         cleanup();
         console.warn('[ExitPlanMode] Timed out after 10 minutes');
+        // PRD #131 — see handleAskUserQuestion for rationale.
+        broadcast('exit-plan-mode:expired', { requestId, reason: 'timeout' });
         resolve(false);
       }
     }, 10 * 60 * 1000);
@@ -2599,7 +2617,12 @@ async function handleExitPlanMode(
 
     const onAbort = () => {
       console.debug('[ExitPlanMode] Aborted by SDK signal');
+      // Guard same as handleAskUserQuestion — see that comment.
+      const wasPending = pendingExitPlanMode.has(requestId);
       cleanup();
+      if (wasPending) {
+        broadcast('exit-plan-mode:expired', { requestId, reason: 'aborted' });
+      }
       reject(new DOMException('Aborted', 'AbortError'));
     };
 
@@ -2655,6 +2678,8 @@ async function handleEnterPlanMode(
       if (pendingEnterPlanMode.has(requestId)) {
         cleanup();
         console.warn('[EnterPlanMode] Timed out after 10 minutes');
+        // PRD #131 — see handleAskUserQuestion for rationale.
+        broadcast('enter-plan-mode:expired', { requestId, reason: 'timeout' });
         resolve(false);
       }
     }, 10 * 60 * 1000);
@@ -2667,7 +2692,12 @@ async function handleEnterPlanMode(
 
     const onAbort = () => {
       console.debug('[EnterPlanMode] Aborted by SDK signal');
+      // Guard same as handleAskUserQuestion — see that comment.
+      const wasPending = pendingEnterPlanMode.has(requestId);
       cleanup();
+      if (wasPending) {
+        broadcast('enter-plan-mode:expired', { requestId, reason: 'aborted' });
+      }
       reject(new DOMException('Aborted', 'AbortError'));
     };
 
@@ -6666,14 +6696,22 @@ async function startStreamingSession(preWarm = false): Promise<void> {
           };
         }
 
-        // Special handling for AskUserQuestion - always requires user interaction
+        // Special handling for AskUserQuestion - always requires user interaction.
+        // PRD #131 — `interrupt: true` on the deny terminates the assistant
+        // turn after the tool_result lands. Without it, the SDK feeds back
+        // "用户取消了问答" and the AI keeps issuing tool calls (Read/Edit/…)
+        // even though the user never gave permission. The `interrupt` knob is
+        // the documented SDK escape hatch (sdk.d.ts:1786-1791
+        // PermissionResult.deny.interrupt) and is exactly the right semantic
+        // for control-transfer tools like AskUserQuestion / ExitPlanMode.
         if (toolName === 'AskUserQuestion') {
           console.log('[canUseTool] AskUserQuestion detected, prompting user');
           const answers = await handleAskUserQuestion(input, options.signal);
           if (answers === null) {
             return {
               behavior: 'deny' as const,
-              message: '用户取消了问答'
+              message: '用户取消了问答',
+              interrupt: true,
             };
           }
           // Return with answers filled in
@@ -6684,12 +6722,20 @@ async function startStreamingSession(preWarm = false): Promise<void> {
           };
         }
 
-        // Special handling for ExitPlanMode - user reviews the plan
+        // Special handling for ExitPlanMode - user reviews the plan.
+        // PRD #131 — `interrupt: true` so the AI stops the turn after the
+        // user rejects. Previously the AI interpreted the deny as "try
+        // again" and kept calling tools (TodoWrite, Read, Edit, even another
+        // ExitPlanMode), defeating the user's intent.
         if (toolName === 'ExitPlanMode') {
           console.log('[canUseTool] ExitPlanMode detected, requesting user approval');
           const approved = await handleExitPlanMode(input, options.signal);
           if (!approved) {
-            return { behavior: 'deny' as const, message: '用户拒绝了方案' };
+            return {
+              behavior: 'deny' as const,
+              message: '用户拒绝了方案',
+              interrupt: true,
+            };
           }
           return {
             behavior: 'allow' as const,
@@ -6697,12 +6743,17 @@ async function startStreamingSession(preWarm = false): Promise<void> {
           };
         }
 
-        // Special handling for EnterPlanMode - user approves entering plan mode
+        // Special handling for EnterPlanMode - user approves entering plan mode.
+        // PRD #131 — same control-transfer semantic; interrupt on rejection.
         if (toolName === 'EnterPlanMode') {
           console.log('[canUseTool] EnterPlanMode detected, requesting user approval');
           const approved = await handleEnterPlanMode(input, options.signal);
           if (!approved) {
-            return { behavior: 'deny' as const, message: '用户拒绝进入计划模式' };
+            return {
+              behavior: 'deny' as const,
+              message: '用户拒绝进入计划模式',
+              interrupt: true,
+            };
           }
           return {
             behavior: 'allow' as const,
