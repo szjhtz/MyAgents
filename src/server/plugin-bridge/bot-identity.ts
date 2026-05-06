@@ -61,8 +61,14 @@ function safeErrMessage(err: unknown): string {
         .replace(/t-[A-Za-z0-9_-]{20,}/g, 't-***');
 }
 
+// Keys are the plugin's self-declared `plugin.id` (the value passed to
+// `api.registerChannel({ plugin: { id: ... } })`), NOT the npm package
+// pluginId. They differ for OpenClaw lark: npm pluginId is "openclaw-lark"
+// but the channel plugin declares `id: 'feishu'`. QQ happens to use
+// "qqbot" for both, which is why the npm-keyed implementation worked
+// for QQ and silently fell through for lark on first ship.
 const RESOLVERS: Record<string, Resolver> = {
-    'openclaw-lark': async (cfg, signal) => {
+    'feishu': async (cfg, signal) => {
         const appId = typeof cfg.appId === 'string' ? cfg.appId : undefined;
         const appSecret = typeof cfg.appSecret === 'string' ? cfg.appSecret : undefined;
         if (!appId || !appSecret) return null;
