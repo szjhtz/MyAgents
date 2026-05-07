@@ -7173,6 +7173,20 @@ async function startStreamingSession(preWarm = false): Promise<void> {
               updatedInput: input as Record<string, unknown>
             };
           }
+
+          // 4. Thought inbox browse: `myagents thought list [--tag <slug>] [--limit N] [--json]`.
+          //    --query is intentionally NOT in the allowlist — it carries arbitrary
+          //    user text (the search string) which can hold shell metachars. That
+          //    form falls through to the normal user-confirm / IM fast-path.
+          //    `thought create` is mutating + carries quoted free-form content,
+          //    so it's never auto-allowed (mirrors `cron add` / `im send-media`).
+          if (/^myagents[ \t]+thought[ \t]+list(?:[ \t]+(?:--tag[ \t]+[a-z0-9][a-z0-9-]{0,31}|--limit[ \t]+\d{1,4}|--json))*[ \t]*$/.test(cmd)) {
+            console.log(`[permission] myagents thought list auto-allowed: ${cmd}`);
+            return {
+              behavior: 'allow' as const,
+              updatedInput: input as Record<string, unknown>
+            };
+          }
         }
 
         // Headless IM fast-path: IM bridges (Telegram/Dingtalk builtin + all OpenClaw plugins
