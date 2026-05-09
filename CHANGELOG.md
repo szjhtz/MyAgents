@@ -9,7 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.14] - 2026-05-10
 
-> AI 等用户决策的弹窗不再因为离开太久而消失。
+> Session 当前由谁在驱动这件事，从顶栏就能看清楚——还能主动把对话推到飞书/Telegram 继续聊。
+
+### Added
+
+- **顶栏现在会显示 session 当前绑定的 IM channel / 定时任务**：之前一个 session 是从飞书 channel 路由过来的，顶栏什么都没说，只能去历史抽屉里才能看出来。现在 session 标题后直接挂一个 `●飞书` / `●定时` 小标签，与历史抽屉风格一致。点击 channel 标签可以看到 agent / 渠道详情。
+- **新对话按钮在 channel-bound session 上会一起把绑定挪到新 session**：之前桌面端点 + 新对话只是清空桌面，飞书 channel 还停在老 session 上——等于"我以为换了对话，其实只换了一边"。现在等价于在 IM 里发 `/new`：channel 跟着到新 session，桌面顶栏的 `●飞书` 标签保持不动。
+- **桌面 session 主动交接到 IM channel**：纯桌面 session 顶栏多了一个 `📤` 图标（与 channel 标签互斥，已绑定就消失）。点击弹窗列出当前工作区对应 Agent 的所有在线 channel，选中即把这条对话推过去——飞书/Telegram/钉钉 那边会收到一条「桌面端已将对话交接到此 channel」系统提示，IM 端用户接着聊就行；桌面端顶栏立即出现 channel 标签。继续在手机上工作的核心场景终于打通。
+- **桌面 session 里的发言会镜像到绑定的 IM channel**：之前是单向的——IM 用户发什么桌面看得到，桌面发什么 IM 看不到，导致 IM 端用户视角丢一段对话。现在桌面用户消息以 `👤 桌面端用户消息` 前缀推到 IM，AI 回复正常推送（与直接对 bot 提问的流式格式一致）。镜像范围：用户文本 + 用户上传的 PNG/JPG + AI 文本回复块；不镜像工具调用、`canUseTool` 审批卡片、partial chunk（避免双端冲突 + 信息噪音）。
 
 ### Fixed
 
@@ -19,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - 抽 `drainPendingInteractiveRequests` 统一 helper 处理四类 pending request 的 drain（permission / AskUserQuestion / ExitPlanMode / EnterPlanMode），mirror `external-session.ts` 已有的 drain 模式。`runStreamingSession` 的 finally 路径现在也会 drain，覆盖 SDK subprocess 异常退出导致 pending 条目泄漏的边缘情况。
 - 同步 `specs/tech_docs/sdk_canUseTool_guide.md` 的 Map 形态示例和超时表，避免后续 AI 看着旧文档把 timer 重新加回来。
+- Surface handover 设计：复用 `router.reset_session()` 已验证路径处理 channel-bound 新对话；handover 通过新 Tauri 命令 `cmd_handover_session_to_channel` 重写 `peer_sessions[chat_key]` + 转移 `SidecarOwner::Agent` 所有权 + 通过 channel adapter 发送系统消息。镜像通过新 management API 端点 `/api/im/mirror` 实现，Sidecar 在 desktop turn 的 user-message 持久化点 + AI text block-end 点 push；目标 channel 由 Rust 通过 `peer_sessions[*].session_id == sid` 反查解析（无 channel 绑定时 silent no-op）。Q4·A 收口：handover 后 IM enqueue handler 检测 `sessionMeta.configSnapshotAt` 优先于 live agent config 解析 permission/model/provider，避免 session 中途权限漂移。
 
 ---
 
