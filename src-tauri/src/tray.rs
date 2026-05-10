@@ -99,8 +99,16 @@ pub fn setup_tray<R: Runtime>(app: &tauri::App<R>) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// Show the main window (and focus it)
-fn show_main_window<R: Runtime>(app: &tauri::AppHandle<R>) {
+/// Show the main window (and focus it).
+///
+/// Single canonical "bring to foreground" routine. Reused by:
+/// - tray icon left-click / "Open" menu
+/// - `single_instance` plugin's second-instance callback (lib.rs)
+/// - `notification` module's click handler (Windows toast Activated event)
+///
+/// Pit-of-success: one helper, three callers; new entry points MUST call this
+/// rather than re-deriving show + unminimize + set_focus.
+pub fn show_main_window<R: Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
