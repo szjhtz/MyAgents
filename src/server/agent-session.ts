@@ -6032,6 +6032,19 @@ export async function enqueueUserMessage(
     querySession = null;
     isProcessing = false;
     setSessionState('idle');
+    // CRITICAL (v0.2.14 dogfood): the abort above set shouldAbortSession=true
+    // to terminate the OLD pre-warmed session. Once awaitSessionTermination
+    // confirms the old session is gone, the flag has done its job — but
+    // leaving it set leaks across the next message. The user's freshly
+    // enqueued message (added below) gets scheduled into startStreamingSession
+    // via setTimeout(0); that function's pre-launch abort guard
+    // (`shouldAbortSession && !preWarm`) then fires "aborted pre-launch by
+    // stop during starting" and drains the just-enqueued message — exactly
+    // the silent-fail manifest in the dogfood log when the user changed
+    // their model from a third-party provider to Anthropic and sent a
+    // message in the same beat. Reset here, NOT after the message-enqueue
+    // below, so the guard sees a clean slate.
+    resetAbortFlag();
     // Explicit cancel — broadcasts queue:cancelled so frontend clears stale pills
     // before the new message (added below) fires queue:added. Without this, the UI
     // would show old pills as phantoms alongside the new one.
@@ -7144,9 +7157,33 @@ async function startStreamingSession(preWarm = false): Promise<void> {
   // instead. Pre-warm doesn't enter this race (it's not user-driven) so
   // the guard is gated on !preWarm.
   if (shouldAbortSession && !preWarm) {
-    console.log('[agent] startStreamingSession: aborted pre-launch by stop during starting');
+    // Defense-in-depth (v0.2.14 dogfood): differentiate the two paths that
+    // can arrive here:
+    //   * User-Stop path — interruptCurrentResponse('starting') drains
+    //     messageQueue BEFORE setting the abort flag, so the queue is
+    //     empty when we get here. No agent-error needed (the user pressed
+    //     Stop themselves; surfacing an error banner would be misleading).
+    //   * Stale-flag path — some upstream code path set shouldAbortSession=true
+    //     and forgot to reset before enqueuing the next user message
+    //     (the original v0.2.14 dogfood was the third-party→Anthropic
+    //     provider switch in enqueueUserMessage; that specific leak is now
+    //     fixed at the source, but this defense catches any future leaks).
+    //     Queue holds the user's just-enqueued message → without an
+    //     explicit error broadcast, the renderer sees the message-replay,
+    //     the queue:cancelled, and chat:status idle, but NO chat:agent-error
+    //     → the #183 retry banner doesn't fire and the user is left
+    //     wondering why their message vanished without a trace.
+    const droppedCount = messageQueue.length;
+    console.log(
+      `[agent] startStreamingSession: aborted pre-launch by stop during starting (droppedQueued=${droppedCount})`,
+    );
     shouldAbortSession = false;
     drainQueueWithCancellation();
+    if (droppedCount > 0) {
+      const errorMessage = '消息发送被中断，请重新发送';
+      lastAgentError = errorMessage;
+      broadcast('chat:agent-error', { message: errorMessage });
+    }
     if (sessionState === 'starting') {
       setSessionState('idle');
     }
