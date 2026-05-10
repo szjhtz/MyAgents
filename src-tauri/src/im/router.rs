@@ -815,14 +815,57 @@ impl SessionRouter {
         }
     }
 
-    /// Release all sessions (shutdown)
+    /// Release all sessions and DROP the peer→session binding map.
+    ///
+    /// **Destructive.** Use only when the bot itself is being torn down
+    /// (`shutdown_bot_instance`) — after this call, `peer_sessions` is empty,
+    /// so any handover / message-routing / `most_recent_peer_session_key`
+    /// lookup will treat the channel as if it had never seen a chat. For
+    /// hot-reload paths that just need sidecars to restart (e.g. runtime
+    /// switch), use [`Self::release_all_sidecars_preserve_bindings`] instead.
     pub fn release_all(&mut self, manager: &ManagedSidecarManager) {
+        let count = self.peer_sessions.len();
         let keys: Vec<String> = self.peer_sessions.keys().cloned().collect();
         for key in keys {
             if let Some(ps) = self.peer_sessions.remove(&key) {
                 let owner = SidecarOwner::Agent(key);
                 let _ = release_session_sidecar(manager, &ps.session_id, &owner);
             }
+        }
+        if count > 0 {
+            ulog_info!(
+                "[im-router] release_all: dropped {} peer_session(s) and released their sidecars",
+                count,
+            );
+        }
+    }
+
+    /// Release running Sidecars but PRESERVE the peer→session bindings.
+    ///
+    /// Used by hot-reload paths where the next IM message must spawn a fresh
+    /// Sidecar (e.g. runtime change from `builtin` → `claude-code`), but the
+    /// channel→chat binding must survive so handover / message routing /
+    /// `/new` resume keep working. Each entry's `sidecar_port` is zeroed —
+    /// `prepare_ensure_sidecar` will see the existing peer_session and re-mint
+    /// the Sidecar on the next dispatch, reusing the same `session_id` so the
+    /// SDK conversation resumes seamlessly.
+    pub fn release_all_sidecars_preserve_bindings(&mut self, manager: &ManagedSidecarManager) {
+        let mut released = 0_usize;
+        let keys: Vec<String> = self.peer_sessions.keys().cloned().collect();
+        for key in keys {
+            if let Some(ps) = self.peer_sessions.get_mut(&key) {
+                let owner = SidecarOwner::Agent(key.clone());
+                let _ = release_session_sidecar(manager, &ps.session_id, &owner);
+                ps.sidecar_port = 0;
+                released += 1;
+            }
+        }
+        if released > 0 {
+            ulog_info!(
+                "[im-router] Released {} sidecar(s); {} peer_session binding(s) preserved for resume",
+                released,
+                self.peer_sessions.len(),
+            );
         }
     }
 }

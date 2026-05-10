@@ -6488,12 +6488,16 @@ pub async fn cmd_update_agent_config(
             *agent.runtime.write().await = normalized.clone();
             for (_ch_id, ch_inst) in &agent.channels {
                 *ch_inst.bot_instance.runtime.write().await = normalized.clone();
+                // Runtime swap requires Sidecar restart (different subprocess
+                // binary). Preserve peer_session bindings so handover and IM
+                // message routing keep working — `release_all` would wipe them
+                // and silently break later operations on this channel.
                 ch_inst
                     .bot_instance
                     .router
                     .lock()
                     .await
-                    .release_all(&sidecarManager);
+                    .release_all_sidecars_preserve_bindings(&sidecarManager);
             }
         }
         if let Some(ref runtime_config) = patch.runtime_config {
