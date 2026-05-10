@@ -2048,14 +2048,23 @@ async fn mirror_to_channel_handler(
 
     // ----- Body text (with prefix for user role) -----
     //
-    // PRD 0.2.14 — visual style differentiation:
-    //   * user role  → `send_plain_text`. On Feishu this maps to `msg_type: text`
-    //     so the IM rendering looks like a real user typed it (not a bot post
-    //     card). On Telegram/Dingtalk/Bridge the trait default falls through
-    //     to `send_message` since those platforms have no Post/Text distinction.
-    //   * assistant role → `send_message` (existing path). Matches the AI's
-    //     direct IM reply format byte-for-byte (Feishu post type, etc.) so
-    //     mirrored AI replies are visually indistinguishable from native ones.
+    // PRD 0.2.14 — visual parity with native IM AI replies:
+    //   * assistant role → `push_text_preferring_stream`. Adapters whose
+    //     channels have a streaming protocol (Bridge plugins with
+    //     `streaming: true` like OpenClaw Lark CardKit, Dingtalk AI Card)
+    //     deliver the mirror via `start_stream → finalize_stream`, landing
+    //     on the SAME visual surface as a live AI reply (CardKit /
+    //     interactive card on Feishu via Bridge, AI Card on Dingtalk).
+    //     Adapters that don't support streaming fall through to
+    //     `send_message` (post-type bubble on native Feishu, plain text on
+    //     Telegram). This is the helper documented at adapter.rs:244-289
+    //     specifically for "out-of-band pushes that should match live
+    //     reply style."
+    //   * user role → plain `send_message`. The user-mirror has a `[From: …]`
+    //     prefix and is conceptually a "system note about an external user
+    //     event" — landing as a plain bubble is the desired visual
+    //     (confirmed by dogfood: the user said the user-mirror bubble was
+    //     correct, only the assistant-mirror needed CardKit treatment).
     let body = req.text.unwrap_or_default();
     let mut text_failed = false;
     let mut sent_text = false;
@@ -2063,9 +2072,11 @@ async fn mirror_to_channel_handler(
         let result = match req.role.as_str() {
             "user" => {
                 let payload = format!("{}\n{}", DESKTOP_USER_PREFIX, body);
-                adapter.send_plain_text(&chat_id, &payload).await
+                adapter.send_message(&chat_id, &payload).await
             }
-            _ => adapter.send_message(&chat_id, &body).await,
+            _ => {
+                im::adapter::push_text_preferring_stream(adapter.as_ref(), &chat_id, &body).await
+            }
         };
         match result {
             Ok(_) => sent_text = true,
