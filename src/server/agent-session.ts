@@ -6958,22 +6958,48 @@ export async function rewindSession(userMessageId: string): Promise<{
     persistedSessionMessageCache.length = 0;
     await persistMessagesToStorage();
 
-    // 7. 设置下次 query 的对话截断点
+    // 7. 设置下次 query 的对话截断点 — 三分支决策树
     //    UUID 有效性校验（OR 逻辑）：
     //    - liveSessionUuids: SDK subprocess stdout 确认过的 UUID（权威但不完整 — resume 后
     //      SDK 不会重新输出旧历史的 UUID）
     //    - currentSessionUuids: 包含磁盘种子 + 运行时 UUID（覆盖 resume 前的历史）
-    //    - 任一集合包含即为有效。过期 UUID 安全性由 session 重建时清空
-    //      currentSessionUuids（!sessionRegistered → clear）保证。
-    //    - 两者都不包含 → session 被重建过，旧 UUID 无意义，创建新 session
+    //
+    //    分支：
+    //      A. uuidIsLive=true        → 设 anchor，传给 SDK 截断
+    //      B. 锚点 stale 但 session 仍活跃 → 仅清 anchor，**保留 session id** (#189 修复)
+    //      C. 没有锚点 / session 未注册 → 真正的 fresh start，新建 session id
+    //
+    //    **注意**：这两个集合只是 MyAgents 自己的视角，**不是 SDK 持久化状态的权威 proxy**。
+    //    MyAgents 的 JSONL 与 SDK 的 JSONL (~/.claude/projects/.../*.jsonl) 是双份存储、
+    //    异步独立写入（CLAUDE.md「双重存储」节）。SDK subprocess 在 flush 完成前被
+    //    interrupt，会留下 MyAgents 有 / SDK 没有 的 UUID。所以"UUID 不在本地集合"
+    //    **不能**推出"SDK session 已被重建"。
+    //
+    //    issue #189 修复（v0.2.15）：anchor stale 时走分支 B —— 保留 session id，仅清掉
+    //    截断锚点。下次 pre-warm 走 `resume: sessionId` 加载 SDK 全量历史。Trade-off：
+    //    AI 看到的历史可能比 UI 截断后更多（短期分歧），但绝对优于上下文全失忆。
+    //    这一行为与 catch-block 的 "No message found" recovery (~line 9219) 对齐 —
+    //    SDK 真正拒绝 anchor 时也走同样语义。
     const uuidIsLive = lastAssistantUuid
       && (liveSessionUuids.has(lastAssistantUuid) || currentSessionUuids.has(lastAssistantUuid));
     if (uuidIsLive) {
       pendingResumeSessionAt = lastAssistantUuid;
+    } else if (lastAssistantUuid && sessionRegistered) {
+      // Anchor 不在本地集合，但 session 仍然有效（SDK 已注册过此 session）。
+      // 不要重建 session — 仅放弃 resumeSessionAt 截断。
+      console.warn(`[agent] rewind: skipping resumeSessionAt — UUID ${lastAssistantUuid} not in live(${liveSessionUuids.size}) or current(${currentSessionUuids.size}) session (stale/rebuilt). Preserving session id (#189); SDK will resume with full history.`);
+      pendingResumeSessionAt = undefined;
+      // Symmetric eviction with catch-block recovery (line ~9227): drop the stale
+      // UUID so subsequent rewinds don't pass the uuidIsLive OR-check and re-enter
+      // a path that would just be rejected by the SDK again. (No-op if absent.)
+      currentSessionUuids.delete(lastAssistantUuid);
+      // 关键：**不**修改 sessionId / sessionRegistered / hasInitialPrompt。
+      // 下次 startStreamingSession 会用 resume: sessionId 加载 SDK 全量历史。
     } else {
-      if (lastAssistantUuid) {
-        console.warn(`[agent] rewind: skipping resumeSessionAt — UUID ${lastAssistantUuid} not in live(${liveSessionUuids.size}) or current(${currentSessionUuids.size}) session (stale/rebuilt)`);
-      }
+      // 两种合法的"fresh start"场景：
+      //   (a) lastAssistantUuid 为 undefined：rewind 到第一条 user message 之前 / 无 SDK
+      //       tracked assistant —— 没有 SDK 上下文可保留
+      //   (b) sessionRegistered=false：SDK 从未注册过这个 session（首次 pre-warm 失败等）
       pendingResumeSessionAt = undefined;
       sessionRegistered = false;
       sessionId = randomUUID();
