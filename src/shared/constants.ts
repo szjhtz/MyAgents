@@ -104,13 +104,6 @@ export const CUSTOM_EVENTS = {
      */
     OPEN_SESSION_IN_NEW_TAB: 'open-session-in-new-tab',
     /**
-     * Fired when the global summon shortcut routes back to an already-active
-     * Launcher tab (no remount, so [mode]-triggered focus effect doesn't
-     * re-run). Launcher's BrandSection listens and calls inputRef.focus().
-     * PRD 0.2.16 §4.2.3 case 1/2.
-     */
-    FOCUS_LAUNCHER_INPUT: 'focus-launcher-input',
-    /**
      * Fired from the global link context menu (LinkContextMenuProvider) when the
      * user picks "预览（内置浏览器）" on an external link. Payload:
      * `{ url: string }`. The currently active Chat tab listens; if its split

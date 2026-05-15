@@ -1,11 +1,13 @@
 // Global shortcut: summon-or-toggle MyAgents from anywhere on the OS.
 //
-// PRD 0.2.16 §3.1 behaviour table:
+// Behaviour:
 //   window visible + focused  →  hide to tray (Raycast-style toggle)
-//   otherwise                 →  show + unminimize + focus + emit `app:summon-launcher`
+//   otherwise                 →  show + unminimize + focus
 //
-// Frontend listens on `app:summon-launcher` and routes the tab/focus logic
-// (see App.tsx). The Rust side never knows about tabs — single responsibility.
+// Deliberately does NOT auto-create a Launcher tab or move keyboard focus —
+// the user found that surprising in dogfooding (PRD revision 2026-05-15).
+// The shortcut is now purely a window visibility toggle; whichever tab was
+// active before stays active.
 //
 // Pit-of-success: we DO NOT reimplement show + unminimize + set_focus here.
 // `tray::show_main_window` is the single canonical "raise window" entry point
@@ -16,7 +18,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 use crate::{ulog_error, ulog_info, ulog_warn};
@@ -217,11 +219,6 @@ fn on_summon_pressed<R: Runtime>(app: &AppHandle<R>) {
         focused
     );
     crate::tray::show_main_window(app);
-
-    // Tell the renderer to route to launcher + focus input.
-    if let Err(e) = app.emit("app:summon-launcher", ()) {
-        ulog_warn!("[global-shortcut] emit summon event failed: {}", e);
-    }
 }
 
 /// Register `accelerator` and remember it for later unregister.
