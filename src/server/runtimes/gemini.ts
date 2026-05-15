@@ -573,6 +573,34 @@ function pickDefaultMode(scenarioType: string): string {
   return isImOrCron ? 'yolo' : 'autoEdit';
 }
 
+/** Drain a `gemini --acp` subprocess's stderr to console.error.
+ *
+ *  REQUIRED on every spawn — not optional diagnostic plumbing. Gemini CLI
+ *  writes OAuth refresh / proxy / debug lines during init; if no one reads
+ *  the pipe, the OS buffer (~64KB on macOS/Linux) fills and gemini blocks
+ *  on its next stderr write — silently hanging the `initialize` RPC until
+ *  our 30s JSON-RPC timeout fires. Observed in practice when queryModels
+ *  spawned without a stderr drain (commit history pre-fix). */
+function drainGeminiStderr(proc: Subprocess, tag = '[gemini-stderr]'): Promise<void> {
+  if (!proc.stderr) return Promise.resolve();
+  return (async () => {
+    const reader = (proc.stderr as ReadableStream<Uint8Array>).getReader();
+    const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const text = decoder.decode(value, { stream: true }).trim();
+        if (text) console.error(`${tag} ${stripAnsi(text)}`);
+      }
+    } catch {
+      /* ignore */
+    } finally {
+      reader.releaseLock();
+    }
+  })();
+}
+
 // ─── GeminiRuntime ───
 
 export class GeminiRuntime implements AgentRuntime {
@@ -581,8 +609,11 @@ export class GeminiRuntime implements AgentRuntime {
   /** In-flight session/new promise from prewarm's startSession path. queryModels
    *  uses this to avoid spawning a duplicate `gemini --acp` when prewarm is
    *  already paying the ~10s cold-start cost — both calls then share the same
-   *  RPC's availableModels result. Set immediately when startSession enters
-   *  session/new dispatch, cleared in finally so failures don't leak it. */
+   *  RPC's availableModels result. Set at startSession step 7.5 (BEFORE the
+   *  initialize handshake) so a queryModels arriving anywhere in
+   *  [spawn → init → session/new] can coordinate; resolved when session/new
+   *  succeeds, rejected from startSession's outer catch on any failure,
+   *  always cleared in startSession's outer finally. */
   private currentSessionNewPromise: Promise<RuntimeModelInfo[]> | null = null;
 
   async detect(): Promise<RuntimeDetection> {
@@ -651,6 +682,9 @@ export class GeminiRuntime implements AgentRuntime {
 
     const rpc = new JsonRpcClient(proc);
     const readerDone = rpc.startReading();
+    // Drain stderr — without this, gemini blocks on a full pipe buffer
+    // when it logs during init (OAuth/proxy/debug). See drainGeminiStderr.
+    const stderrDone = drainGeminiStderr(proc, '[gemini-stderr/queryModels]');
 
     // Yield to the microtask queue so the reader loop enters its first `await read()`
     // before we start writing. Without this, the first write may race with subprocess
@@ -684,6 +718,7 @@ export class GeminiRuntime implements AgentRuntime {
         /* ignore */
       }
       await readerDone.catch(() => {});
+      await stderrDone.catch(() => {});
     }
   }
 
@@ -787,24 +822,39 @@ export class GeminiRuntime implements AgentRuntime {
       });
     });
 
-    // 7. Drain stderr for diagnostic logging.
-    if (proc.stderr) {
-      (async () => {
-        const reader = (proc.stderr as ReadableStream<Uint8Array>).getReader();
-        const decoder = new TextDecoder();
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            const text = decoder.decode(value, { stream: true }).trim();
-            if (text) console.error(`[gemini-stderr] ${stripAnsi(text)}`);
-          }
-        } catch {
-          /* ignore */
-        } finally {
-          reader.releaseLock();
-        }
-      })();
+    // 7. Drain stderr — required to keep gemini's pipe buffer from filling.
+    void drainGeminiStderr(proc);
+
+    // 7.5 Race-coordinate with queryModels for the new-session path.
+    //   /api/runtime/models and /api/runtime/prewarm fire in parallel from
+    //   Chat.tsx. Without coordination, queryModels spawns its own
+    //   `gemini --acp` and the two processes compete for OAuth refresh /
+    //   network / Node-startup resources — observed to mutually time out
+    //   on `initialize` (30s wait, both die, user-send falls through to a
+    //   third spawn → ~40s total wait).
+    //
+    //   Set the in-flight promise BEFORE `initialize` so any concurrent
+    //   queryModels arriving anywhere in [spawn → init → session/new]
+    //   can await this single spawn instead of forking a duplicate. The
+    //   resolve happens after session/new succeeds (where availableModels
+    //   becomes known); reject + clear are bound to startSession's outer
+    //   catch/finally so initialize / session/new failures both propagate.
+    //
+    //   Resume path doesn't set this: session/load doesn't return
+    //   availableModels, so queryModels has nothing to share — it has to
+    //   spawn its own (resolve/reject default to noop in that case and
+    //   fire harmlessly below).
+    let resolveModelsPromise: (m: RuntimeModelInfo[]) => void = () => {};
+    let rejectModelsPromise: (e: unknown) => void = () => {};
+    if (!options.resumeSessionId) {
+      this.currentSessionNewPromise = new Promise<RuntimeModelInfo[]>((resolve, reject) => {
+        resolveModelsPromise = resolve;
+        rejectModelsPromise = reject;
+      });
+      // Pre-attach a noop catch so a startup failure rejection doesn't trip
+      // Node's unhandled-rejection warning when no concurrent queryModels
+      // happens to be listening. queryModels still observes via its await.
+      this.currentSessionNewPromise.catch(() => {});
     }
 
     try {
@@ -859,51 +909,30 @@ export class GeminiRuntime implements AgentRuntime {
         const newParams = { cwd: options.workspacePath, mcpServers: [] };
         console.log(`[gemini] RPC session/new: ${JSON.stringify(newParams)}`);
 
-        // Race-coordinate with queryModels: a concurrent /api/runtime/models call
-        // (Chat.tsx:691, fired in parallel with this prewarm) sees this promise
-        // and awaits it instead of spawning a duplicate gemini --acp. Without
-        // this coordination both calls pay independent ~10s cold-starts and
-        // contend for CPU/auth — total ~17s vs the ~10s we get by sharing.
-        let resolveModelsPromise!: (m: RuntimeModelInfo[]) => void;
-        let rejectModelsPromise!: (e: unknown) => void;
-        this.currentSessionNewPromise = new Promise<RuntimeModelInfo[]>((resolve, reject) => {
-          resolveModelsPromise = resolve;
-          rejectModelsPromise = reject;
-        });
-        // Pre-attach a noop catch so a rejection (rpc.call throws) doesn't trip
-        // Node's unhandled-rejection warning when no concurrent queryModels is
-        // listening. queryModels still observes the rejection via its own await.
-        this.currentSessionNewPromise.catch(() => {});
-
-        try {
-          const result = (await geminiProc.rpc.call('session/new', newParams, 30_000)) as {
-            sessionId: string;
-            modes?: { currentModeId?: string };
-            models?: {
-              currentModelId?: string;
-              availableModels?: Array<{ modelId: string; name: string; description?: string }>;
-            };
+        const result = (await geminiProc.rpc.call('session/new', newParams, 30_000)) as {
+          sessionId: string;
+          modes?: { currentModeId?: string };
+          models?: {
+            currentModelId?: string;
+            availableModels?: Array<{ modelId: string; name: string; description?: string }>;
           };
-          geminiProc.sessionId = result.sessionId;
+        };
+        geminiProc.sessionId = result.sessionId;
 
-          // Prime modelCache from this RPC's availableModels — skips the duplicate
-          // gemini --acp spawn that would otherwise fire from /api/runtime/models.
-          const models = buildModelListFromAcpResponse(result.models);
-          modelCache = { models, timestamp: Date.now() };
-          resolveModelsPromise(models);
+        // Prime modelCache + resolve the queryModels coordination promise
+        // (created at step 7.5, awaited by any concurrent queryModels call).
+        // Reject path lives in startSession's outer catch so initialize
+        // failures also propagate out.
+        const models = buildModelListFromAcpResponse(result.models);
+        modelCache = { models, timestamp: Date.now() };
+        resolveModelsPromise(models);
 
-          onEvent({
-            kind: 'session_init',
-            sessionId: result.sessionId,
-            model: result.models?.currentModelId || options.model || '',
-            tools: [],
-          });
-        } catch (err) {
-          rejectModelsPromise(err);
-          throw err;
-        } finally {
-          this.currentSessionNewPromise = null;
-        }
+        onEvent({
+          kind: 'session_init',
+          sessionId: result.sessionId,
+          model: result.models?.currentModelId || options.model || '',
+          tools: [],
+        });
       }
 
       // 10. Apply desired mode if not default.
@@ -958,6 +987,12 @@ export class GeminiRuntime implements AgentRuntime {
         geminiProc.replayMode = false;
       }
     } catch (err) {
+      // Propagate startup failure to any concurrent queryModels awaiting our
+      // coordination promise (set at step 7.5). Without this, a queryModels
+      // caller would hang on the never-resolved promise until the GC-ish
+      // module-state cleanup. queryModels' own catch falls through to a
+      // queryModelsViaAcp retry — appropriate, since this spawn is dead.
+      rejectModelsPromise(err);
       // Flag must be set BEFORE proc.kill so proc.exited.then observes it.
       geminiProc.intentionalKillDuringStartup = true;
       try {
@@ -1002,6 +1037,12 @@ export class GeminiRuntime implements AgentRuntime {
         );
       }
       throw err;
+    } finally {
+      // Always clear the queryModels coordination promise so the next start
+      // doesn't see a stale stalled promise. resolve/reject already fired
+      // by this point (success path → resolved at session/new; failure path
+      // → rejected in catch above), so observers have settled.
+      this.currentSessionNewPromise = null;
     }
 
     return geminiProc;
