@@ -11,7 +11,6 @@
  */
 
 import type { McpServerDefinition } from '../shared/config-types';
-import { PRESET_PROVIDERS } from '../shared/config-types';
 import { SDK_RESERVED_MCP_NAMES } from './agent-session';
 import {
   loadConfig,
@@ -22,8 +21,9 @@ import {
   saveProjects,
   redactSecret,
   findProvider,
+  getAllEffectiveProviders,
+  isProviderDisabled,
   getProvidersDir,
-  loadCustomProviderFiles,
   type AdminAppConfig,
   type AgentConfigSlim,
   type ChannelConfigSlim,
@@ -765,17 +765,7 @@ export function handleModelList(): AdminResponse {
   const apiKeys = config.providerApiKeys ?? {};
   const verifyStatus = config.providerVerifyStatus ?? {};
 
-  // Load preset providers (statically imported — see top of file).
-  // Cast via `unknown` because `Provider` doesn't carry a string index
-  // signature; the downstream loop accesses fields by name through `String(p.id)`
-  // and `p.config as Record<string, unknown> | undefined`, which works on
-  // both shapes uniformly.
-  const presetProviders: Array<Record<string, unknown>> = (PRESET_PROVIDERS ?? []) as unknown as Array<Record<string, unknown>>;
-
-  // Load custom providers
-  const customProviders = loadCustomProviderFiles();
-
-  const allProviders = [...presetProviders, ...customProviders];
+  const allProviders = getAllEffectiveProviders(config);
   const data = allProviders.map(p => {
     const id = String(p.id);
     const cfg = p.config as Record<string, unknown> | undefined;
@@ -786,6 +776,7 @@ export function handleModelList(): AdminResponse {
       baseUrl: cfg?.baseUrl ? String(cfg.baseUrl) : undefined,
       isBuiltin: !!p.isBuiltin,
       protocol: p.apiProtocol ? String(p.apiProtocol) : 'anthropic',
+      enabled: p.enabled !== false,
       hasApiKey: !!apiKeys[id],
       status: (verifyStatus[id] as Record<string, unknown>)?.status ?? 'not-set',
     };
@@ -811,6 +802,9 @@ export async function handleModelSetKey(payload: { id: string; apiKey: string })
 export async function handleModelSetDefault(payload: { id: string }): Promise<AdminResponse> {
   const { id } = payload;
   if (!id) return { success: false, error: 'Missing required field: id' };
+  if (isProviderDisabled(id)) {
+    return { success: false, error: `Provider '${id}' is disabled. Re-enable it before setting it as default.` };
+  }
 
   await atomicModifyConfig(c => ({
     ...c,
