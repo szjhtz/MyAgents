@@ -7,6 +7,7 @@ pub mod cli;
 pub mod config_io;
 mod commands;
 pub mod cron_task;
+mod global_shortcut;
 pub mod im;
 pub mod notification;
 pub mod local_http;
@@ -50,7 +51,7 @@ use sidecar::{
 };
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use tauri::{Emitter, Listener, Manager};
+use tauri::{Emitter, Listener, LogicalPosition, Manager, Url, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_autostart::MacosLauncher;
 
 // Note: lib.rs is the crate root, so `#[macro_export]` macros (ulog_info!,
@@ -200,6 +201,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--minimized"])))
+        .plugin(global_shortcut::build_plugin())
         .manage(sidecar_state)
         .manage(sse_proxy_state)
         .manage(im_bot_state)
@@ -303,6 +305,9 @@ pub fn run() {
             cmd_get_background_sessions,
             // Proxy hot-reload
             cmd_propagate_proxy,
+            // Global shortcut (summon-or-toggle, PRD 0.2.16)
+            global_shortcut::cmd_get_global_summon_shortcut,
+            global_shortcut::cmd_set_global_summon_shortcut,
             // OS notification + click-to-foreground deep-link (v0.2.14)
             notification::cmd_show_notification,
             notification::cmd_consume_notification_click,
@@ -414,6 +419,7 @@ pub fn run() {
             thought::cmd_thought_delete,
             thought::cmd_thought_merge,
             thought::cmd_thought_open_dir,
+            thought::cmd_thought_set_archived,
             // Task Center — Task commands (v0.1.69)
             task::cmd_task_create_direct,
             task::cmd_task_create_from_alignment,
@@ -460,12 +466,138 @@ pub fn run() {
             // append protected by a mutex.
             logger::init_buffered_writer();
 
-            // macOS WKWebView function-key tofu workaround. Tauri creates
-            // config windows before this user setup hook runs; that is still
-            // fine because ObjC method lookup is dynamic, so adding methods to
-            // the WryWebView class here affects already-created instances
-            // before the user can type. Install after unified logging is ready
-            // so diagnostics land in ~/.myagents/logs/unified-YYYY-MM-DD.log.
+            // Main window: programmatic creation so we can attach
+            // `on_navigation` to block external top-frame navigation. The
+            // native WKWebView context menu's "Open Link" entry triggers a
+            // direct top-frame navigation that bypasses React `onClick`
+            // handlers — without this gate the entire app gets replaced by
+            // the linked page with no way back (bug: right-click → 软件报废).
+            //
+            // Why programmatic instead of config: Tauri 2.x has no setter for
+            // `on_navigation` on an already-created window. So
+            // `tauri.conf.json` has `windows: []` and we build here. All other
+            // original config (size, decorations, traffic light position) is
+            // replicated below. `WebviewUrl::default()` resolves to the
+            // configured devUrl (dev) / `tauri://localhost` (prod)
+            // automatically — no manual dev/prod branching needed.
+            //
+            // Order: must be BEFORE macos_arrow_filter::install_arrow_key_filter
+            // because the filter looks up the WryWebView ObjC class which is
+            // only registered after the first webview is constructed.
+            let main_window_builder = WebviewWindowBuilder::new(
+                app,
+                "main",
+                WebviewUrl::default(),
+            )
+            .title("MyAgents")
+            .inner_size(1200.0, 800.0)
+            .min_inner_size(800.0, 600.0)
+            .resizable(true)
+            .fullscreen(false)
+            .center()
+            .decorations(true)
+            // `transparent(false)` is the default in Tauri and the setter is
+            // gated behind `macos-private-api` on macOS, so we omit it (the
+            // original config field was effectively a no-op).
+            .on_navigation(|url: &Url| {
+                let scheme = url.scheme();
+                // Tauri-internal schemes: always allow.
+                // - tauri / ipc: Tauri 2.x core IPC bridges
+                // - asset: tauri-plugin-fs asset serving
+                // - myagents / myagents-internal: app's custom protocols
+                //
+                // SECURITY: `data:` / `blob:` / `about:` are intentionally NOT
+                // in the top-frame allowlist. A `data:text/html,<script>…` URL
+                // navigated at top-frame would replace the entire app with
+                // attacker-controlled HTML running in the privileged renderer
+                // origin (full access to Tauri IPC). These schemes are still
+                // usable inside iframes / <img> / <video> (where on_navigation
+                // doesn't fire) — only top-frame replacement is blocked here.
+                // Right-click "Open Link" from WebKit's native context menu on
+                // such an anchor would otherwise bypass `LinkContextMenuProvider`
+                // (which only intercepts http/https/mailto).
+                if matches!(
+                    scheme,
+                    "tauri"
+                        | "ipc"
+                        | "asset"
+                        | "myagents"
+                        | "myagents-internal"
+                ) {
+                    return true;
+                }
+                // http(s): allow only localhost / 127.0.0.1 / tauri.localhost /
+                // ipc.localhost. Dev mode loads from http://localhost:5173,
+                // Windows prod loads from http://tauri.localhost, IPC bridges
+                // use http://ipc.localhost. Anything else is an external URL —
+                // hand it to the OS default browser and cancel the navigation
+                // so the main webview stays on the app.
+                if scheme == "http" || scheme == "https" {
+                    let host = url.host_str().unwrap_or("");
+                    if matches!(
+                        host,
+                        "localhost" | "127.0.0.1" | "tauri.localhost" | "ipc.localhost"
+                    ) {
+                        return true;
+                    }
+                    ulog_info!(
+                        "[main-window] BLOCKED external nav → system browser: {}",
+                        url
+                    );
+                    browser::spawn_external_open(url.as_str());
+                    return false;
+                }
+                // mailto / tel: route to OS default handler, cancel nav.
+                if matches!(scheme, "mailto" | "tel") {
+                    browser::spawn_external_open(url.as_str());
+                    return false;
+                }
+                // Everything else (javascript:, file:, unknown schemes) — block.
+                ulog_warn!(
+                    "[main-window] BLOCKED nav with scheme {}: {}",
+                    scheme,
+                    url
+                );
+                false
+            });
+
+            // Platform-specific window chrome — replicates the original
+            // tauri.conf.json fields. macOS uses the Overlay title bar style
+            // (custom titlebar + native traffic lights at LogicalPosition).
+            // Windows handles decorations later in setup (see "Windows: Remove
+            // system decorations" block below); the builder runs uniformly.
+            //
+            // Traffic light Y must align to the custom titlebar's vertical
+            // centerline. The titlebar is `h-11` (44px) in
+            // `src/renderer/components/CustomTitleBar.tsx`; traffic lights are
+            // ~13px tall on macOS. Centering math: Y_top = (44 - 13) / 2 ≈ 15.
+            // We use 14 (matching X) — that lands icon-center at ~Y=20, within
+            // 2px of the titlebar's 22px geometric center, visually centered.
+            //
+            // History: the original `tauri.conf.json` shipped with Y=20 since
+            // the OSS init in c8dfef81 (2026-01-26) — icons sat ~4-5px below
+            // the tab content the whole time. c3ef3c7f migrated the value
+            // verbatim into this builder (no regression introduced by the
+            // migration; pre-existing miscenter caught later).
+            #[cfg(target_os = "macos")]
+            let main_window_builder = main_window_builder
+                .hidden_title(true)
+                .title_bar_style(tauri::TitleBarStyle::Overlay)
+                .traffic_light_position(LogicalPosition::new(14.0, 14.0));
+
+            main_window_builder
+                .build()
+                .map_err(|e| {
+                    ulog_error!("[App] Failed to build main window: {}", e);
+                    e
+                })?;
+
+            // macOS WKWebView function-key tofu workaround. Must run AFTER
+            // the main window is built so the WryWebView ObjC class is
+            // registered with the runtime (the class is created lazily on
+            // first webview construction). ObjC method lookup is dynamic, so
+            // adding methods here affects the already-created instance before
+            // the user can type.
             #[cfg(target_os = "macos")]
             macos_arrow_filter::install_arrow_key_filter();
 
@@ -567,6 +699,10 @@ pub fn run() {
             if let Err(e) = tray::setup_tray(app) {
                 ulog_error!("[App] Failed to setup system tray: {}", e);
             }
+
+            // Register global summon shortcut from config (PRD 0.2.16).
+            // Failures are non-fatal — they surface in the Settings panel.
+            global_shortcut::setup_on_startup(app.handle());
 
             // Frontend confirms exit (from X button → ConfirmDialog → "退出" button).
             // Delegate to `AppHandle::exit(0)` and let `RunEvent::ExitRequested` run
