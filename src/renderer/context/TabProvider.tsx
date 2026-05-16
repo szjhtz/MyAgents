@@ -2308,6 +2308,13 @@ export default function TabProvider({
             }
             case 'plugins:changed': {
                 window.dispatchEvent(new CustomEvent('myagents:plugins-changed', { detail: data }));
+                // Plugins live on AppConfig.{plugins, enabledPlugins} —
+                // also nudge ConfigProvider to re-read so consumers like
+                // SimpleChatInput's plugins submenu and Agent settings
+                // pick up the install/toggle without needing a manual
+                // refresh. Without this the Chat tool menu shows "no
+                // plugins" even after the user just enabled 13 of them.
+                window.dispatchEvent(new CustomEvent('myagents:config-changed', { detail: data }));
                 break;
             }
 

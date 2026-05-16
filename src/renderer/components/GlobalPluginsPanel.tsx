@@ -28,6 +28,7 @@ import {
   Trash2,
   FolderOpen,
   ChevronLeft,
+  Puzzle,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -228,31 +229,33 @@ export default function GlobalPluginsPanel({
   }
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0 flex-1 space-y-2.5">
-          <h2 className="text-xl font-semibold text-[var(--ink)]">插件 Plugins</h2>
-          <p className="text-[14px] leading-relaxed text-[var(--ink-muted)]">
-            Claude 插件（skills + agents + hooks + MCP）— 来自 GitHub 或本地目录
-          </p>
-          <p className="text-[13px] leading-relaxed text-[var(--ink-muted)]">
-            <span className="mr-1">ⓘ</span>
-            这里的开关决定插件「<b className="text-[var(--ink)]">在各工作区是否可见</b>」。要实际启用，请去 Agent 设置或 Chat 输入框 ➜ 工具 ➜ 插件子菜单里勾选。
-          </p>
-          <p className="text-[13px] leading-relaxed text-[var(--ink-muted)]">
-            <span className="mr-1">ⓘ</span>
-            仅作用于 MyAgents 自带 Runtime；外部 Runtime 请在该 CLI 内用 <code className="font-mono text-[12px]">/plugin</code> 管理。
-          </p>
+    <div className="space-y-4">
+      {/* Header — Skills-page parity: icon + title + count chip on left, "+ 安装" on right.
+       *  Explanatory blurb sits under header as a secondary line; the two ⓘ hints fold
+       *  into a single info row so the page weight matches SkillsCommandsList §300-313. */}
+      <div className="flex items-center justify-between gap-4">
+        <div className="flex items-center gap-2">
+          <Puzzle className="h-5 w-5 text-[var(--accent-warm)]" />
+          <h3 className="text-base font-semibold text-[var(--ink)]">插件 Plugins</h3>
+          <span className="rounded-full bg-[var(--paper-inset)] px-2 py-0.5 text-xs text-[var(--ink-muted)]">
+            {plugins.length}
+          </span>
         </div>
         <button
           type="button"
           onClick={() => setShowInstall(true)}
-          className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg bg-[var(--accent)] px-3.5 py-2 text-[14px] font-medium text-white hover:opacity-90"
+          className="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg bg-[var(--button-primary-bg)] px-3 py-1.5 text-sm font-medium text-[var(--button-primary-text)] transition-colors hover:bg-[var(--button-primary-bg-hover)]"
         >
           <Plus className="h-4 w-4" />
           安装插件
         </button>
       </div>
+
+      <p className="text-[13px] leading-relaxed text-[var(--ink-muted)]">
+        Claude 插件（skills + agents + hooks + MCP）— 来自 GitHub 或本地目录。
+        这里的开关决定插件「<b className="text-[var(--ink-secondary)]">在各工作区是否可见</b>」；要实际启用，请去 Agent 设置或 Chat 输入框 ➜ 工具 ➜ 插件子菜单里勾选。
+        仅作用于 MyAgents 自带 Runtime；外部 Runtime 请在该 CLI 内用 <code className="font-mono text-[12px]">/plugin</code> 管理。
+      </p>
 
       {loading ? (
         <div className="flex items-center justify-center py-12 text-[var(--ink-muted)]">
@@ -260,12 +263,15 @@ export default function GlobalPluginsPanel({
           <span className="ml-2 text-sm">加载中…</span>
         </div>
       ) : plugins.length === 0 ? (
-        <div className="rounded-lg border border-dashed border-[var(--border)] py-16 text-center text-[14px] leading-relaxed text-[var(--ink-muted)]">
-          尚未安装任何插件。<br />
-          点右上角「安装插件」从 GitHub 或本地路径添加。
+        <div className="rounded-xl bg-[var(--paper-elevated)] py-16 text-center">
+          <Puzzle className="mx-auto h-10 w-10 text-[var(--ink-subtle)]" />
+          <p className="mt-3 text-[14px] font-medium text-[var(--ink)]">还没有插件</p>
+          <p className="mt-1 text-[13px] text-[var(--ink-muted)]">
+            点右上角「安装插件」从 GitHub 或本地路径添加。
+          </p>
         </div>
       ) : (
-        <ul className="space-y-2">
+        <div className="grid grid-cols-2 gap-3">
           {plugins.map(item => (
             <PluginCard
               key={item.id}
@@ -274,7 +280,7 @@ export default function GlobalPluginsPanel({
               onToggle={() => toggleEnabled(item)}
             />
           ))}
-        </ul>
+        </div>
       )}
 
       {showInstall && (
@@ -316,62 +322,61 @@ function PluginCard({
   onOpen: () => void;
   onToggle: () => void;
 }) {
+  // Card spec mirrors SkillCard (SkillsCommandsList.tsx:487-540) exactly so
+  // Plugins / Skills / Agents share the same compact card identity in the
+  // Settings page. Only deviation: decorative icon is Puzzle (vs Sparkles)
+  // and there's a version chip slot alongside the author chip.
   const isBad = item.status !== 'ok';
+  const isHidden = !item.enabled && !isBad;
   return (
-    <li
-      className={`group rounded-lg border ${
-        isBad ? 'border-amber-400/50 bg-amber-500/5' : 'border-[var(--border)]'
-      } px-4 py-3 hover:bg-[var(--hover-bg)] cursor-pointer transition-colors`}
+    <div
+      className={`group flex cursor-pointer flex-col gap-1.5 rounded-xl bg-[var(--paper-elevated)] px-3.5 py-3 transition-shadow hover:shadow-sm ${
+        isHidden ? 'opacity-55' : ''
+      } ${isBad ? 'ring-1 ring-amber-400/40' : ''}`}
       onClick={onOpen}
     >
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            {isBad && <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500" />}
-            <h3 className="truncate text-[15px] font-medium text-[var(--ink)]">
-              {item.name}
-            </h3>
-            {item.version && (
-              <span className="shrink-0 text-[13px] text-[var(--ink-muted)]">
-                v{item.version}
-              </span>
-            )}
-          </div>
-          {item.description && (
-            <p className="mt-1 line-clamp-1 text-[13px] text-[var(--ink-muted)]">
-              {item.description}
-            </p>
-          )}
-          {item.warning && (
-            <p className="mt-1 text-[12px] text-amber-600 dark:text-amber-500">
-              ⚠ {item.warning}
-            </p>
-          )}
-        </div>
-        <div className="shrink-0">
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onToggle();
-            }}
-            disabled={isBad}
-            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
-              item.enabled
-                ? 'bg-[var(--accent)]'
-                : 'bg-[var(--border)]'
-            } ${isBad ? 'opacity-50 cursor-not-allowed' : ''}`}
-            title={item.enabled ? '隐藏（不在工作区里出现）' : '显示（可被工作区选择）'}
-          >
-            <span
-              className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
-                item.enabled ? 'translate-x-5' : 'translate-x-1'
-              }`}
-            />
-          </button>
-        </div>
+      <div className="flex items-center gap-2">
+        {isBad && <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-500" />}
+        <h4 className="min-w-0 flex-1 truncate text-[14px] font-semibold text-[var(--ink)]">
+          {item.name}
+        </h4>
+        <Puzzle className="h-3.5 w-3.5 shrink-0 text-[var(--accent-warm)]" />
+        {item.version && (
+          <span className="shrink-0 rounded-full bg-[var(--paper-inset)] px-2 py-0.5 text-[10px] font-medium tracking-[0.04em] text-[var(--ink-muted)]">
+            v{item.version}
+          </span>
+        )}
+        <button
+          type="button"
+          role="switch"
+          aria-checked={item.enabled}
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggle();
+          }}
+          disabled={isBad}
+          className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors focus:outline-none ${
+            item.enabled ? 'bg-[var(--accent)]' : 'bg-[var(--line-strong)]'
+          } ${isBad ? 'cursor-not-allowed opacity-50' : ''}`}
+          title={item.enabled ? '隐藏（不在工作区里出现）' : '显示（可被工作区选择）'}
+        >
+          <span
+            className={`pointer-events-none inline-block h-3.5 w-3.5 rounded-full bg-[var(--toggle-thumb)] shadow-sm ring-0 transition-transform ${
+              item.enabled ? 'translate-x-4' : 'translate-x-0.5'
+            }`}
+          />
+        </button>
       </div>
-    </li>
+      {/* Description — min-h reserves 2-line height like SkillCard so grid rows align. */}
+      <p className="line-clamp-2 min-h-[2.6em] text-[13px] leading-relaxed text-[var(--ink-muted)]">
+        {item.description || '暂无描述'}
+      </p>
+      {item.warning && (
+        <p className="text-[12px] text-amber-600 dark:text-amber-500">
+          ⚠ {item.warning}
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -394,7 +399,15 @@ function PluginDetailView({
   const openInFinder = useCallback(async () => {
     try {
       const { invoke } = await import('@tauri-apps/api/core');
-      await invoke('cmd_open_path_external', { path: plugin.installPath });
+      // `fullPath` (camelCase) + nullable `workspace` per
+      // src-tauri/src/workspace_files/system_open.rs::cmd_open_path_external.
+      // Previously passed `{ path }` which silently no-op'd (Rust never
+      // saw the param). See useWorkspaceFileService.ts:497 for the
+      // canonical call shape.
+      await invoke('cmd_open_path_external', {
+        fullPath: plugin.installPath,
+        workspace: null,
+      });
     } catch (err) {
       console.warn('[GlobalPluginsPanel] open in finder failed:', err);
     }
@@ -405,37 +418,43 @@ function PluginDetailView({
       <button
         type="button"
         onClick={onBack}
-        className="inline-flex items-center gap-1 text-sm text-[var(--ink-muted)] hover:text-[var(--ink)]"
+        className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[13px] text-[var(--ink-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--ink)]"
       >
         <ChevronLeft className="h-4 w-4" />
         返回列表
       </button>
 
+      {/* Title block — matches Skills detail header weight */}
       <div>
-        <div className="flex items-center gap-3">
-          <h2 className="text-xl font-semibold text-[var(--ink)]">{plugin.name}</h2>
+        <div className="flex items-baseline gap-3">
+          <h2 className="text-[22px] font-semibold text-[var(--ink)]">{plugin.name}</h2>
           {plugin.version && (
-            <span className="text-sm text-[var(--ink-muted)]">v{plugin.version}</span>
+            <span className="text-[14px] text-[var(--ink-muted)]">v{plugin.version}</span>
           )}
         </div>
         {plugin.description && (
-          <p className="mt-2 text-sm text-[var(--ink-muted)]">{plugin.description}</p>
+          <p className="mt-2 text-[14px] leading-relaxed text-[var(--ink-secondary)]">
+            {plugin.description}
+          </p>
         )}
       </div>
 
+      {/* Action buttons — DESIGN.md §6.1: pill-shaped (rounded-full) using
+       *  button tokens. Toggle uses secondary, open-dir is ghost, uninstall
+       *  uses danger semantic (var(--error)) per §6.1 危险按钮 spec. */}
       <div className="flex flex-wrap gap-2">
         <button
           type="button"
           onClick={onToggle}
           disabled={plugin.status !== 'ok'}
-          className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-sm hover:bg-[var(--hover-bg)] disabled:opacity-50"
+          className="rounded-full bg-[var(--button-secondary-bg)] px-4 py-1.5 text-[13px] font-medium text-[var(--button-secondary-text)] transition-colors hover:bg-[var(--button-secondary-bg-hover)] disabled:opacity-50"
         >
-          {plugin.enabled ? '禁用' : '启用'}
+          {plugin.enabled ? '隐藏（不再各工作区可见）' : '显示（可被工作区选择）'}
         </button>
         <button
           type="button"
           onClick={openInFinder}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border)] px-3 py-1.5 text-sm hover:bg-[var(--hover-bg)]"
+          className="inline-flex items-center gap-1.5 rounded-full bg-[var(--button-secondary-bg)] px-4 py-1.5 text-[13px] font-medium text-[var(--button-secondary-text)] transition-colors hover:bg-[var(--button-secondary-bg-hover)]"
         >
           <FolderOpen className="h-3.5 w-3.5" />
           打开目录
@@ -443,29 +462,37 @@ function PluginDetailView({
         <button
           type="button"
           onClick={onUninstall}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-red-400/40 px-3 py-1.5 text-sm text-red-600 hover:bg-red-500/10 dark:text-red-400"
+          className="inline-flex items-center gap-1.5 rounded-full bg-[var(--error-bg)] px-4 py-1.5 text-[13px] font-medium text-[var(--error)] transition-colors hover:brightness-95"
         >
           <Trash2 className="h-3.5 w-3.5" />
           卸载
         </button>
       </div>
 
-      <section className="space-y-2">
-        <h3 className="text-sm font-semibold text-[var(--ink)]">元数据</h3>
-        <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm">
-          <MetaRow label="作者" value={plugin.author} />
-          <MetaRow label="License" value={plugin.license} />
-          <MetaRow label="主页" value={plugin.homepage} link />
-          <MetaRow label="仓库" value={plugin.repository} link />
-          <MetaRow label="来源" value={plugin.sourceUrl} />
-          <MetaRow label="安装路径" value={plugin.installPath} mono />
-          <MetaRow label="安装时间" value={new Date(plugin.installedAt).toLocaleString()} />
-        </dl>
+      {/* Metadata card — paper-elevated with no border, mirroring the
+       *  紧凑卡片 (compact card) spec from DESIGN.md §6.2. */}
+      <section>
+        <h3 className="mb-3 text-[11px] font-semibold uppercase tracking-[0.12em] text-[var(--ink-muted)]">
+          元数据
+        </h3>
+        <div className="rounded-xl bg-[var(--paper-elevated)] px-5 py-4">
+          <dl className="grid grid-cols-[max-content_1fr] gap-x-5 gap-y-2 text-[13px]">
+            <MetaRow label="作者" value={plugin.author} />
+            <MetaRow label="License" value={plugin.license} />
+            <MetaRow label="主页" value={plugin.homepage} link />
+            <MetaRow label="仓库" value={plugin.repository} link />
+            <MetaRow label="来源" value={plugin.sourceUrl} />
+            <MetaRow label="安装路径" value={plugin.installPath} mono />
+            <MetaRow label="安装时间" value={new Date(plugin.installedAt).toLocaleString()} />
+          </dl>
+        </div>
       </section>
 
       {components && (
-        <section className="space-y-2">
-          <h3 className="text-sm font-semibold text-[var(--ink)]">组件清单</h3>
+        <section>
+          <h3 className="mb-3 text-[11px] font-semibold uppercase tracking-[0.12em] text-[var(--ink-muted)]">
+            组件清单
+          </h3>
           <ComponentInventoryGrid inv={components} />
         </section>
       )}
@@ -502,13 +529,13 @@ function MetaRow({
   return (
     <>
       <dt className="text-[var(--ink-muted)]">{label}</dt>
-      <dd className={`break-all ${mono ? 'font-mono text-xs' : ''}`}>
+      <dd className={`break-all text-[var(--ink)] ${mono ? 'font-mono text-[12px]' : ''}`}>
         {renderAsLink ? (
           <a
             href={value}
             target="_blank"
             rel="noreferrer"
-            className="text-[var(--accent)] hover:underline"
+            className="text-[var(--accent-warm)] hover:underline"
           >
             {value}
           </a>
@@ -534,13 +561,17 @@ function ComponentInventoryGrid({ inv }: { inv: PluginComponentInventory }) {
       {blocks.map(([label, value]) => (
         <ComponentBlock key={label} label={label} value={value} />
       ))}
-      <div className="rounded-lg border border-[var(--border)] px-3 py-2">
-        <div className="text-xs text-[var(--ink-muted)]">Hooks</div>
-        <div className="mt-1 text-sm">{inv.hooks} 个事件处理器</div>
+      <div className="rounded-xl bg-[var(--paper-elevated)] px-4 py-3 transition-shadow hover:shadow-sm">
+        <div className="text-[11px] font-medium uppercase tracking-[0.04em] text-[var(--ink-muted)]">Hooks</div>
+        <div className="mt-1.5 text-[14px] text-[var(--ink)]">
+          {inv.hooks > 0 ? `${inv.hooks} 个事件处理器` : <span className="text-[var(--ink-muted)]">— 无</span>}
+        </div>
       </div>
-      <div className="rounded-lg border border-[var(--border)] px-3 py-2">
-        <div className="text-xs text-[var(--ink-muted)]">Bin</div>
-        <div className="mt-1 text-sm">{inv.hasBin ? '✓ 有可执行文件' : '— 无'}</div>
+      <div className="rounded-xl bg-[var(--paper-elevated)] px-4 py-3 transition-shadow hover:shadow-sm">
+        <div className="text-[11px] font-medium uppercase tracking-[0.04em] text-[var(--ink-muted)]">Bin</div>
+        <div className="mt-1.5 text-[14px] text-[var(--ink)]">
+          {inv.hasBin ? '✓ 有可执行文件' : <span className="text-[var(--ink-muted)]">— 无</span>}
+        </div>
       </div>
     </div>
   );
@@ -556,13 +587,13 @@ function ComponentBlock({
   const items = Array.isArray(value) ? value : [];
   const count = items.length;
   return (
-    <div className="rounded-lg border border-[var(--border)] px-3 py-2">
-      <div className="text-xs text-[var(--ink-muted)]">{label}</div>
-      <div className="mt-1 text-sm">
+    <div className="rounded-xl bg-[var(--paper-elevated)] px-4 py-3 transition-shadow hover:shadow-sm">
+      <div className="text-[11px] font-medium uppercase tracking-[0.04em] text-[var(--ink-muted)]">{label}</div>
+      <div className="mt-1.5 text-[14px] text-[var(--ink)]">
         {count === 0 ? <span className="text-[var(--ink-muted)]">— 无</span> : `${count} 个`}
       </div>
       {count > 0 && (
-        <div className="mt-1 line-clamp-2 text-xs text-[var(--ink-muted)]">
+        <div className="mt-1 line-clamp-2 text-[12px] text-[var(--ink-muted)]">
           {items.join(', ')}
         </div>
       )}
