@@ -105,31 +105,36 @@ const AgentStatusPanel = memo(function AgentStatusPanel({ messages, containerRef
   if (!mounted) return null;
 
   return (
-    // V1: 直接 right-6 贴 chat 区右侧，不再走 max-w-3xl 容器（会把面板拉到内圈）。
-    // pointer-events-none 在外层；pointer-events-auto 只在 panel card 上——周围空白
-    // 不挡 MessageList 选区/点击（Codex W2）。fade-out 期间禁用 pointer-events 避免
-    // 半透明误击。
+    // 面板右边对齐 chat 输入框右边：复用 SimpleChatInput 的「inset-x-0 px-4 flex
+    // justify-center + 内层 max-w-3xl」layout。再在 max-w-3xl 内 justify-end 把
+    // panel 推到右边。这样 panel 右边 = max-w-3xl 右边 = input 右边，跟着 chat
+    // 区宽度自动同步。之前用 right-6 在宽 chat 上会跟 input 错开（input 在 max-
+    // w-3xl 居中后离 chat 右边可以远到 100+px）。
+    // pointer-events-none 都在外两层，panel card 自己挂 pointer-events-auto，
+    // 周围空白不挡 MessageList 选区/点击（Codex W2）。
     <div
-      className="pointer-events-none absolute bottom-[8rem] right-6 z-20"
+      className="pointer-events-none absolute inset-x-0 bottom-[8rem] z-20 flex justify-center px-4"
       aria-hidden={!hasContent}
     >
-      <div
-        className={`flex w-[260px] flex-col overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--paper-elevated)]/95 shadow-lg backdrop-blur-md transition-opacity duration-200 ${
-          opaque ? 'pointer-events-auto opacity-100' : 'pointer-events-none opacity-0'
-        }`}
-      >
-        {/* 展开态：上面 sections，下面 bar；收起态：仅 bar */}
-        {expanded && (
-          <div className="flex flex-col">
-            <TodoSection todos={state.todos} />
-            <SubagentSection subagents={state.subagents} containerRef={containerRef} onJumpToTool={onJumpToTool} />
-          </div>
-        )}
-        <AgentStatusBar
-          summary={state.summary}
-          expanded={expanded}
-          onToggle={toggle}
-        />
+      <div className="flex w-full max-w-3xl justify-end">
+        <div
+          className={`flex w-[260px] flex-col overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--paper-elevated)]/95 shadow-lg backdrop-blur-md transition-opacity duration-200 ${
+            opaque ? 'pointer-events-auto opacity-100' : 'pointer-events-none opacity-0'
+          }`}
+        >
+          {/* 展开态：上面 sections，下面 bar；收起态：仅 bar */}
+          {expanded && (
+            <div className="flex flex-col">
+              <TodoSection todos={state.todos} />
+              <SubagentSection subagents={state.subagents} containerRef={containerRef} onJumpToTool={onJumpToTool} />
+            </div>
+          )}
+          <AgentStatusBar
+            summary={state.summary}
+            expanded={expanded}
+            onToggle={toggle}
+          />
+        </div>
       </div>
     </div>
   );
