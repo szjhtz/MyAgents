@@ -2668,9 +2668,15 @@ async function main() {
               return jsonResponse({ success: false, error: errMsg }, 400);
             }
             if (payload.model) effectiveModel = payload.model;
-            if (effectiveRuntimeConfig) {
-              effectiveRuntimeConfig = { ...effectiveRuntimeConfig, model: payload.model ?? effectiveRuntimeConfig.model };
-            }
+            // Issue #204: defense-in-depth for external-runtime tasks landing
+            // on a non-followAgent intent. Always construct (not gated on
+            // existence), and let canonical `runtimeConfig.model` win over
+            // CLI-shorthand `payload.model` over any pre-existing value.
+            effectiveRuntimeConfig = {
+              ...(payload.runtimeConfig ?? {}),
+              model: payload.runtimeConfig?.model ?? payload.model ?? effectiveRuntimeConfig?.model,
+              permissionMode: payload.runtimeConfig?.permissionMode ?? payload.permissionMode ?? effectiveRuntimeConfig?.permissionMode,
+            };
             console.log(`[cron] execute providerId=${payload.providerId} resolved=${effectiveProviderEnv === 'subscription' ? 'subscription' : (effectiveProviderEnv as ProviderEnv).baseUrl ?? 'anthropic'} model=${effectiveModel ?? 'default'}`);
           } else if (intent === 'followAgent') {
             if (currentSessionId) {
@@ -2719,10 +2725,18 @@ async function main() {
                   }
                 }
                 if (resolved.runtime !== 'builtin') {
+                  // Issue #204: task overrides win over agent snapshot for
+                  // external runtimes. Precedence: explicit `runtimeConfig.model`
+                  // (canonical task shape from UI) → `payload.model` (CLI passes
+                  // `--model X` to top-level Task.model for external runtime →
+                  // forwarded here) → agent snapshot fallback. Without honoring
+                  // `payload.model`, `myagents task create-direct --runtime codex
+                  // --model X` silently runs with the agent's default model and
+                  // the runtime CLI 404s on the wrong model id.
                   effectiveRuntimeConfig = {
                     ...(payload.runtimeConfig ?? {}),
-                    model: resolved.model ?? payload.runtimeConfig?.model,
-                    permissionMode: resolved.permissionMode ?? payload.runtimeConfig?.permissionMode,
+                    model: payload.runtimeConfig?.model ?? payload.model ?? resolved.model,
+                    permissionMode: payload.runtimeConfig?.permissionMode ?? payload.permissionMode ?? resolved.permissionMode,
                   };
                 }
               }
@@ -2737,9 +2751,15 @@ async function main() {
             // agent-session.ts:5381-5383 treats undefined as "keep current".
             effectiveProviderEnv = 'subscription';
             if (payload.model) effectiveModel = payload.model;
-            if (effectiveRuntimeConfig) {
-              effectiveRuntimeConfig = { ...effectiveRuntimeConfig, model: payload.model ?? effectiveRuntimeConfig.model };
-            }
+            // Issue #204: defense-in-depth for external-runtime tasks landing
+            // on a non-followAgent intent. Always construct (not gated on
+            // existence), and let canonical `runtimeConfig.model` win over
+            // CLI-shorthand `payload.model` over any pre-existing value.
+            effectiveRuntimeConfig = {
+              ...(payload.runtimeConfig ?? {}),
+              model: payload.runtimeConfig?.model ?? payload.model ?? effectiveRuntimeConfig?.model,
+              permissionMode: payload.runtimeConfig?.permissionMode ?? payload.permissionMode ?? effectiveRuntimeConfig?.permissionMode,
+            };
           } else if (intent === 'explicit') {
             if (!payload.providerEnv) {
               console.error(`[cron] execute intent=explicit but payload.providerEnv is missing — refusing to run`);
@@ -2752,9 +2772,15 @@ async function main() {
             }
             effectiveProviderEnv = payload.providerEnv;
             if (payload.model) effectiveModel = payload.model;
-            if (effectiveRuntimeConfig) {
-              effectiveRuntimeConfig = { ...effectiveRuntimeConfig, model: payload.model ?? effectiveRuntimeConfig.model };
-            }
+            // Issue #204: defense-in-depth for external-runtime tasks landing
+            // on a non-followAgent intent. Always construct (not gated on
+            // existence), and let canonical `runtimeConfig.model` win over
+            // CLI-shorthand `payload.model` over any pre-existing value.
+            effectiveRuntimeConfig = {
+              ...(payload.runtimeConfig ?? {}),
+              model: payload.runtimeConfig?.model ?? payload.model ?? effectiveRuntimeConfig?.model,
+              permissionMode: payload.runtimeConfig?.permissionMode ?? payload.permissionMode ?? effectiveRuntimeConfig?.permissionMode,
+            };
           }
 
           // Cron tasks are unattended — "user didn't pick" must map to the
@@ -2983,9 +3009,15 @@ async function main() {
             return jsonResponse({ success: false, error: errMsg }, 400);
           }
           if (payload.model) effectiveModel = payload.model;
-          if (effectiveRuntimeConfig) {
-            effectiveRuntimeConfig = { ...effectiveRuntimeConfig, model: payload.model ?? effectiveRuntimeConfig.model };
-          }
+          // Issue #204: defense-in-depth for external-runtime tasks landing
+          // on a non-followAgent intent. Always construct (not gated on
+          // existence), and let canonical `runtimeConfig.model` win over
+          // CLI-shorthand `payload.model` over any pre-existing value.
+          effectiveRuntimeConfig = {
+            ...(payload.runtimeConfig ?? {}),
+            model: payload.runtimeConfig?.model ?? payload.model ?? effectiveRuntimeConfig?.model,
+            permissionMode: payload.runtimeConfig?.permissionMode ?? payload.permissionMode ?? effectiveRuntimeConfig?.permissionMode,
+          };
           console.log(`[cron] execute-sync providerId=${payload.providerId} resolved=${effectiveProviderEnv === 'subscription' ? 'subscription' : (effectiveProviderEnv as ProviderEnv).baseUrl ?? 'anthropic'} runMode=${effectiveRunMode} model=${effectiveModel ?? 'default'}`);
         } else if (intent === 'followAgent') {
           // Legacy snapshot-based resolution.
@@ -3030,13 +3062,21 @@ async function main() {
                 }
               }
               if (resolved.runtime !== 'builtin') {
+                // Issue #204: task overrides win over agent snapshot for
+                // external runtimes. Precedence: explicit `runtimeConfig.model`
+                // (canonical task shape from UI) → `payload.model` (CLI passes
+                // `--model X` to top-level Task.model for external runtime →
+                // forwarded here) → agent snapshot fallback. Without honoring
+                // `payload.model`, `myagents task create-direct --runtime codex
+                // --model X` silently runs with the agent's default model and
+                // the runtime CLI 404s on the wrong model id.
                 effectiveRuntimeConfig = {
                   ...(payload.runtimeConfig ?? {}),
-                  model: resolved.model ?? payload.runtimeConfig?.model,
-                  permissionMode: resolved.permissionMode ?? payload.runtimeConfig?.permissionMode,
+                  model: payload.runtimeConfig?.model ?? payload.model ?? resolved.model,
+                  permissionMode: payload.runtimeConfig?.permissionMode ?? payload.permissionMode ?? resolved.permissionMode,
                 };
               }
-              console.log(`[cron] execute-sync intent=followAgent session=${snapshotSessionId} runMode=${effectiveRunMode} snapshotLocked=${Boolean(sessionMeta.configSnapshotAt)} model=${effectiveModel ?? 'default'} runtime=${resolved.runtime}`);
+              console.log(`[cron] execute-sync intent=followAgent session=${snapshotSessionId} runMode=${effectiveRunMode} snapshotLocked=${Boolean(sessionMeta.configSnapshotAt)} model=${effectiveModel ?? 'default'} runtime=${resolved.runtime} runtimeConfigModel=${effectiveRuntimeConfig?.model ?? 'default'}`);
             }
           }
           // #119 followAgent backward-compat: pre-#119 the pragmatic fix
@@ -3055,9 +3095,15 @@ async function main() {
           // See /cron/execute above for the full rationale.
           effectiveProviderEnv = 'subscription';
           if (payload.model) effectiveModel = payload.model;
-          if (effectiveRuntimeConfig) {
-            effectiveRuntimeConfig = { ...effectiveRuntimeConfig, model: payload.model ?? effectiveRuntimeConfig.model };
-          }
+          // Issue #204: defense-in-depth for external-runtime tasks landing
+          // on a non-followAgent intent. Always construct (not gated on
+          // existence), and let canonical `runtimeConfig.model` win over
+          // CLI-shorthand `payload.model` over any pre-existing value.
+          effectiveRuntimeConfig = {
+            ...(payload.runtimeConfig ?? {}),
+            model: payload.runtimeConfig?.model ?? payload.model ?? effectiveRuntimeConfig?.model,
+            permissionMode: payload.runtimeConfig?.permissionMode ?? payload.permissionMode ?? effectiveRuntimeConfig?.permissionMode,
+          };
           console.log(`[cron] execute-sync intent=subscription runMode=${effectiveRunMode} model=${effectiveModel ?? 'default'} (snapshot bypassed)`);
         } else if (intent === 'explicit') {
           // Cron explicitly wants its captured provider — never inherit from agent.
@@ -3077,9 +3123,15 @@ async function main() {
           }
           effectiveProviderEnv = payload.providerEnv;
           if (payload.model) effectiveModel = payload.model;
-          if (effectiveRuntimeConfig) {
-            effectiveRuntimeConfig = { ...effectiveRuntimeConfig, model: payload.model ?? effectiveRuntimeConfig.model };
-          }
+          // Issue #204: defense-in-depth for external-runtime tasks landing
+          // on a non-followAgent intent. Always construct (not gated on
+          // existence), and let canonical `runtimeConfig.model` win over
+          // CLI-shorthand `payload.model` over any pre-existing value.
+          effectiveRuntimeConfig = {
+            ...(payload.runtimeConfig ?? {}),
+            model: payload.runtimeConfig?.model ?? payload.model ?? effectiveRuntimeConfig?.model,
+            permissionMode: payload.runtimeConfig?.permissionMode ?? payload.permissionMode ?? effectiveRuntimeConfig?.permissionMode,
+          };
           // Type-narrow for the log: the explicit branch can only land on a
           // ProviderEnv object (assigned just above from `payload.providerEnv`,
           // which the early-return refuses to be undefined). Mirror the
